@@ -1,0 +1,47 @@
+services:
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  airflow:
+    image: apache/airflow:2.9.1
+    container_name: airflow
+    depends_on:
+      - postgres
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+      _AIRFLOW_WWW_USER_FIRSTNAME: Admin
+      _AIRFLOW_WWW_USER_LASTNAME: Admin
+      _AIRFLOW_WWW_USER_EMAIL: admin@example.com
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./dags:/opt/airflow/dags
+    command: >
+      bash -c "
+        airflow db migrate &&
+        airflow users create \
+          --username \$$_AIRFLOW_WWW_USER_USERNAME \
+          --password \$$_AIRFLOW_WWW_USER_PASSWORD \
+          --firstname \$$_AIRFLOW_WWW_USER_FIRSTNAME \
+          --lastname \$$_AIRFLOW_WWW_USER_LASTNAME \
+          --role Admin \
+          --email \$$_AIRFLOW_WWW_USER_EMAIL;
+        airflow scheduler &
+        exec airflow webserver
+      "
+
+volumes:
+  postgres_data:
