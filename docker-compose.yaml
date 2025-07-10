@@ -1,3 +1,5 @@
+version: "3.9"
+
 services:
   postgres:
     image: postgres:15
@@ -10,6 +12,7 @@ services:
       - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    restart: always
 
   airflow:
     image: apache/airflow:2.9.1
@@ -18,8 +21,9 @@ services:
       - postgres
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      PYTHONPATH: /opt/airflow
       _AIRFLOW_WWW_USER_USERNAME: admin
       _AIRFLOW_WWW_USER_PASSWORD: admin
       _AIRFLOW_WWW_USER_FIRSTNAME: Admin
@@ -29,19 +33,11 @@ services:
       - "8080:8080"
     volumes:
       - ./dags:/opt/airflow/dags
-    command: >
-      bash -c "
-        airflow db migrate &&
-        airflow users create \
-          --username \$$_AIRFLOW_WWW_USER_USERNAME \
-          --password \$$_AIRFLOW_WWW_USER_PASSWORD \
-          --firstname \$$_AIRFLOW_WWW_USER_FIRSTNAME \
-          --lastname \$$_AIRFLOW_WWW_USER_LASTNAME \
-          --role Admin \
-          --email \$$_AIRFLOW_WWW_USER_EMAIL;
-        airflow scheduler &
-        exec airflow webserver
-      "
+      - ./services:/opt/airflow/services
+      - ./requirements.txt:/opt/airflow/requirements.txt
+      - ./script/entrypoint.sh:/entrypoint.sh
+    entrypoint: /entrypoint.sh
+    restart: always
 
 volumes:
   postgres_data:
