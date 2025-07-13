@@ -1,11 +1,13 @@
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.hooks.base import BaseHook
 from datetime import datetime
 import os
 import uuid
 import subprocess
 import yt_dlp
 import logging
+import psycopg2
 
 
 def check_raw_video_codec(path):
@@ -23,23 +25,13 @@ def check_raw_video_codec(path):
 
 
 def download_and_prepare_tiktok_video(url, output_dir="/opt/airflow/videos"):
-    """
-    Télécharge une vidéo TikTok, la convertit en H.264 (AVC) + AAC pour React Native,
-    et retourne le chemin final de la vidéo.
-    """
     os.makedirs(output_dir, exist_ok=True)
-
-    # Noms de fichiers temporaires
     video_id = str(uuid.uuid4())
     raw_path = os.path.join(output_dir, f"{video_id}_raw.mp4")
     final_path = os.path.join(output_dir, f"{video_id}.mp4")
 
     logging.info("⏬ Téléchargement de la vidéo TikTok...")
-    ydl_opts = {
-        'outtmpl': raw_path,
-        'format': 'best',
-        'quiet': True,
-    }
+    ydl_opts = {'outtmpl': raw_path, 'format': 'best', 'quiet': True}
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -52,31 +44,20 @@ def download_and_prepare_tiktok_video(url, output_dir="/opt/airflow/videos"):
     if codec != "hevc":
         logging.warning(f"⚠️ Codec inattendu : {codec} (attendu : hevc)")
 
-    logging.info("🎞️ Conversion en format H.264 (AVC) + AAC...")
+    logging.info("🎞️ Conversion en H.264 (AVC) + AAC...")
     ffmpeg_cmd = [
-        "ffmpeg",
-        "-y",  # overwrite
-        "-i", raw_path,
-        "-c:v", "libx264",
-        "-profile:v", "baseline",
-        "-level", "3.0",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-movflags", "+faststart",
+        "ffmpeg", "-y", "-i", raw_path,
+        "-c:v", "libx264", "-profile:v", "baseline", "-level", "3.0", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
         final_path
     ]
 
-    try:
-        result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            logging.error("❌ Erreur ffmpeg :\n" + result.stderr)
-            raise RuntimeError("Conversion échouée.")
-        logging.info(f"✅ Conversion réussie. Fichier prêt à l'emploi : {final_path}")
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"❌ Erreur pendant la conversion avec ffmpeg : {e}")
+    result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        logging.error("❌ Erreur ffmpeg :\n" + result.stderr)
+        raise RuntimeError("Conversion échouée.")
+    logging.info(f"✅ Conversion réussie : {final_path}")
 
-    # Nettoyer le fichier source brut
     if os.path.exists(raw_path):
         os.remove(raw_path)
         logging.info(f"🧹 Fichier brut supprimé : {raw_path}")
@@ -84,10 +65,56 @@ def download_and_prepare_tiktok_video(url, output_dir="/opt/airflow/videos"):
     return final_path
 
 
+def insert_video_into_django_db(video_path, event_id=1, conn_id='postgres'):
+    logging.info(f"📥 Insertion vidéo pour l'event {event_id}")
+    conn = BaseHook.get_connection(conn_id)
+
+    try:
+        connection = psycopg2.connect(
+            host=conn.host,
+            port=conn.port,
+            user=conn.login,
+            password=conn.password,
+            dbname=conn.schema
+        )
+        cursor = connection.cursor()
+
+        cursor.execute("""
+            SELECT id FROM profil_filesevent
+            WHERE event_id = %s AND image IS NULL
+            LIMIT 1;
+        """, (event_id,))
+        row = cursor.fetchone()
+
+        if row:
+            file_event_id = row[0]
+            logging.info(f"📝 Mise à jour de FilesEvent ID={file_event_id}")
+            relative_path = video_path.replace("/opt/airflow/videos/", "videos/")
+
+            cursor.execute("""
+                UPDATE profil_filesevent
+                SET video = %s
+                WHERE id = %s;
+            """, (relative_path, file_event_id))
+
+            connection.commit()
+            logging.info("✅ Vidéo insérée dans la base Django.")
+        else:
+            logging.warning("⚠️ Aucun FilesEvent trouvé avec image NULL.")
+
+    except Exception as e:
+        logging.error(f"❌ Erreur PostgreSQL : {e}")
+        raise
+    finally:
+        cursor.close()
+        connection.close()
+
+
 def run_tiktok_download():
     url = "https://www.tiktok.com/@sofiaosaoncamara/video/7352841442324221217"
-    result = download_and_prepare_tiktok_video(url)
-    logging.info(f"🎯 Vidéo prête : {result}")
+    final_path = download_and_prepare_tiktok_video(url)
+    logging.info(f"🎯 Vidéo téléchargée : {final_path}")
+    insert_video_into_django_db(final_path, event_id=1)
 
 
 with DAG(
