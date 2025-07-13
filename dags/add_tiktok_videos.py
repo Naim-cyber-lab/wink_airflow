@@ -79,7 +79,7 @@ def insert_video_into_django_db(video_path, event_id=1, conn_id='my_postgres'):
         )
         cursor = connection.cursor()
 
-        relative_path = video_path.replace("/opt/airflow/videos/", "videos/")
+        relative_path = video_path.replace("/opt/airflow/videos/", "")
 
         cursor.execute("""
             INSERT INTO profil_filesevent (event_id, video, image)

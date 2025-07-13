@@ -32,6 +32,7 @@ services:
     ports:
       - "8080:8080"
     volumes:
+      - ./videos:/opt/airflow/videos/
       - ./dags:/opt/airflow/dags
       - ./services:/opt/airflow/services
       - ./requirements.txt:/opt/airflow/requirements.txt
