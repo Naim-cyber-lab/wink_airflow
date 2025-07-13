@@ -66,7 +66,7 @@ def download_and_prepare_tiktok_video(url, output_dir="/opt/airflow/videos"):
 
 
 def insert_video_into_django_db(video_path, event_id=1, conn_id='my_postgres'):
-    logging.info(f"📥 Insertion vidéo pour l'event {event_id}")
+    logging.info(f"📥 Insertion d'une nouvelle ligne pour l'event {event_id}")
     conn = BaseHook.get_connection(conn_id)
 
     try:
@@ -79,28 +79,15 @@ def insert_video_into_django_db(video_path, event_id=1, conn_id='my_postgres'):
         )
         cursor = connection.cursor()
 
+        relative_path = video_path.replace("/opt/airflow/videos/", "videos/")
+
         cursor.execute("""
-            SELECT id FROM profil_filesevent
-            WHERE event_id = %s AND image IS NULL
-            LIMIT 1;
-        """, (event_id,))
-        row = cursor.fetchone()
+            INSERT INTO profil_filesevent (event_id, video, image)
+            VALUES (%s, %s, NULL);
+        """, (event_id, relative_path))
 
-        if row:
-            file_event_id = row[0]
-            logging.info(f"📝 Mise à jour de FilesEvent ID={file_event_id}")
-            relative_path = video_path.replace("/opt/airflow/videos/", "videos/")
-
-            cursor.execute("""
-                UPDATE profil_filesevent
-                SET video = %s
-                WHERE id = %s;
-            """, (relative_path, file_event_id))
-
-            connection.commit()
-            logging.info("✅ Vidéo insérée dans la base Django.")
-        else:
-            logging.warning("⚠️ Aucun FilesEvent trouvé avec image NULL.")
+        connection.commit()
+        logging.info("✅ Nouvelle vidéo insérée dans la base Django.")
 
     except Exception as e:
         logging.error(f"❌ Erreur PostgreSQL : {e}")
