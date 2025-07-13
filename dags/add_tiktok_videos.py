@@ -65,7 +65,7 @@ def download_and_prepare_tiktok_video(url, output_dir="/opt/airflow/videos"):
     return final_path
 
 
-def insert_video_into_django_db(video_path, event_id=1, conn_id='postgres'):
+def insert_video_into_django_db(video_path, event_id=1, conn_id='my_postgres'):
     logging.info(f"📥 Insertion vidéo pour l'event {event_id}")
     conn = BaseHook.get_connection(conn_id)
 
