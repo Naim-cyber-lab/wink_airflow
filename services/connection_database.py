@@ -1,28 +1,28 @@
-# database.py
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, Session
-from contextlib import contextmanager
+from airflow.providers.postgres.hooks.postgres import PostgresHook
 
-POSTGRES_USER = "myuser"
-POSTGRES_PASSWORD = "mypassword"
-POSTGRES_DB = "mydatabase"
-POSTGRES_HOST = "192.168.1.208"
-POSTGRES_PORT = "5432"
+class DatabaseConnector:
+    def __init__(self, conn_id: str = 'postgres'):
+        self.hook = PostgresHook(postgres_conn_id=conn_id)
+        self.conn = None
+        self.cursor = None
 
-DATABASE_URL = f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
+    def __enter__(self):
+        self.conn = self.hook.get_conn()
+        self.cursor = self.conn.cursor()
+        return self
 
-class Database:
-    def __init__(self, url: str = DATABASE_URL):
-        self.engine = create_engine(url)
-        self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.cursor.close()
+        self.conn.close()
 
-    @contextmanager
-    def get_session(self):
-        db = self.SessionLocal()
-        try:
-            yield db
-        finally:
-            db.close()
+    def fetchall(self, query: str, params=None):
+        self.cursor.execute(query, params or [])
+        return self.cursor.fetchall()
 
-# Instance globale à réutiliser
-db_instance = Database()
+    def fetchone(self, query: str, params=None):
+        self.cursor.execute(query, params or [])
+        return self.cursor.fetchone()
+
+    def execute(self, query: str, params=None):
+        self.cursor.execute(query, params or [])
+        self.conn.commit()

@@ -15,7 +15,7 @@ services:
     restart: always
 
   airflow:
-    image: apache/airflow:2.9.1
+    build: .
     container_name: airflow
     depends_on:
       - postgres

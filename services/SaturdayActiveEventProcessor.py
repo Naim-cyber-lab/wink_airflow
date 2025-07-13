@@ -1,18 +1,10 @@
+from services.connection_database import DatabaseConnector
+
 # ✅ Classe de traitement spécial du samedi
 class SaturdayActiveEventProcessor:
     def run(self, **context):
-        print("🌟 Traitement spécifique du samedi")
-        # Exemple :
-        # self.clean_cache()
-        # special_videos = self.get_featured_videos()
-        # for video in special_videos:
-        #     self.save_featured_event(video)
+        active_event_ids = [1, 2, 3]  # ou récupérés dynamiquement
 
-    # def clean_cache(self):
-    #     print("Nettoyage du cache...")
-
-    # def get_featured_videos(self):
-    #     return ["video_speciale.mp4"]
-
-    # def save_featured_event(self, video):
-    #     print("Insertion spéciale :", video)
+        with DatabaseConnector('postgres') as db:
+            for event_id in active_event_ids:
+                db.execute("SELECT update_publication_date_event(%s);", [event_id])

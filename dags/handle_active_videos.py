@@ -5,12 +5,11 @@ from typing import Callable
 
 from services.SaturdayActiveEventProcessor import SaturdayActiveEventProcessor
 from services.RegularActiveEventProcessor import RegularActiveEventProcessor
-
 # ✅ Fabrique de DAG factorisée
 class ScheduledJobFactory:
     def __init__(self, base_dag_id: str, processor_cls: Callable[[], object]):
         self.base_dag_id = base_dag_id
-        self.processor_cls = processor_cls  # Une classe avec une méthode `.run(**context)`
+        self.processor_cls = processor_cls
 
     def create_dag(self, dag_id_suffix: str, cron_schedule: str) -> DAG:
         dag_id = f"{self.base_dag_id}__{dag_id_suffix}"
