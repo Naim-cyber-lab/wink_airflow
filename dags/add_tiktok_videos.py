@@ -103,6 +103,68 @@ def run_tiktok_download():
     logging.info(f"🎯 Vidéo téléchargée : {final_path}")
     insert_video_into_django_db(final_path, event_id=1)
 
+def process_validated_scrapping_videos(conn_id='my_postgres'):
+    logging.info("🔍 Récupération des vidéos validées dans profil_scrapping_video...")
+    conn = BaseHook.get_connection(conn_id)
+
+    try:
+        connection = psycopg2.connect(
+            host=conn.host,
+            port=conn.port,
+            user=conn.login,
+            password=conn.password,
+            dbname=conn.schema
+        )
+        cursor = connection.cursor()
+
+        cursor.execute("""
+            SELECT id, bio, video, adresse, site_web, site_reservation, validation,
+                   code_postal, region, titre, hastags
+            FROM profil_scrapping_video
+            WHERE validation = 'true'
+        """)
+        rows = cursor.fetchall()
+        logging.info(f"📦 {len(rows)} vidéos validées à traiter.")
+
+        for row in rows:
+            logging.info(f"🔍 Traitement de la ligne : {row}")
+            (_id, bio, video_url, adresse, site_web, site_reservation, validation,
+             code_postal, region, titre, hashtags) = row
+
+            logging.info(f"➡️ Traitement de l’entrée ID={_id} : {titre}")
+
+            # Création de l'event
+            cursor.execute("""
+                INSERT INTO profil_event (titre, adresse, region, city, codePostal, bioEvent, website)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (
+                titre, adresse, region, region, code_postal, bio, site_web
+            ))
+            event_id = cursor.fetchone()[0]
+            logging.info(f"🆕 Nouvel event ID={event_id} créé.")
+
+            # Télécharger et convertir la vidéo
+            final_path = download_and_prepare_tiktok_video(video_url)
+            relative_path = final_path.replace("/opt/airflow/videos/", "")
+
+            # Insertion de la vidéo liée
+            cursor.execute("""
+                INSERT INTO profil_filesevent (event_id, video, image)
+                VALUES (%s, %s, NULL)
+            """, (event_id, relative_path))
+            logging.info(f"🎥 Vidéo insérée pour l'event ID={event_id}")
+
+        connection.commit()
+        logging.info("✅ Toutes les vidéos ont été traitées.")
+
+    except Exception as e:
+        logging.error(f"❌ Erreur : {e}")
+        raise
+    finally:
+        cursor.close()
+        connection.close()
+
 
 with DAG(
     dag_id="download_tiktok_video_dag",
@@ -113,6 +175,6 @@ with DAG(
 ) as dag:
 
     download_task = PythonOperator(
-        task_id="download_and_prepare_video",
-        python_callable=run_tiktok_download,
+        task_id="process_scrapping_videos",
+        python_callable=process_validated_scrapping_videos,
     )
