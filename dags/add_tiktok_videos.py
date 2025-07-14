@@ -133,13 +133,15 @@ def process_validated_scrapping_videos(conn_id='my_postgres'):
 
             logging.info(f"➡️ Traitement de l’entrée ID={_id} : {titre}")
 
+            creatorWinkerId = 116  # ID du créateur Winker( nacim.souni@outlook.fr )
+
             # Création de l'event
             cursor.execute("""
                 INSERT INTO profil_event (titre, adresse, region, city, codePostal, bioEvent, website)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, creatorWinkerId)
                 RETURNING id
             """, (
-                titre, adresse, region, region, code_postal, bio, site_web
+                titre, adresse, region, region, code_postal, bio, site_web, creatorWinkerId
             ))
             event_id = cursor.fetchone()[0]
             logging.info(f"🆕 Nouvel event ID={event_id} créé.")
