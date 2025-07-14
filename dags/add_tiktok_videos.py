@@ -137,7 +137,7 @@ def process_validated_scrapping_videos(conn_id='my_postgres'):
 
             # Création de l'event
             cursor.execute("""
-                INSERT INTO profil_event (titre, adresse, region, city, codePostal, bioEvent, website, creatorWinker_id)
+                INSERT INTO profil_event (titre, adresse, region, city, "codePostal", bioEvent, website, creatorWinker_id)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
             """, (
