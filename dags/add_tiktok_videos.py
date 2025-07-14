@@ -158,6 +158,36 @@ def process_validated_scrapping_videos(conn_id='my_postgres'):
             """, (event_id, relative_path))
             logging.info(f"🎥 Vidéo insérée pour l'event ID={event_id}")
 
+            # Insertion des hashtags associés
+            logging.info("🏷️ Insertion des préférences ( hastags ) associées...")
+            if hashtags:
+                hashtag_list = [tag.strip() for tag in hashtags.split(',') if tag.strip()]
+                for tag in hashtag_list:
+                    if tag in [
+                        "Sport", "Party", "NoRestriction_Food", "Halal", "Cacher", "Vegan",
+                        "Culture", "EGame", "Bar", "Free_Activities", "Games_Play",
+                        "Trip", "Humanitary", "TouristAttraction", "Attraction", "Other"
+                    ]:
+                        # Construction dynamique de la requête avec la colonne correspondante à True
+                        cursor.execute(
+                            f"""
+                            INSERT INTO profil_preference (event_id, "{tag}")
+                            VALUES (%s, TRUE)
+                            """,
+                            (event_id,)
+                        )
+                        logging.info(f"✅ Préférence '{tag}' insérée pour l'event ID={event_id}")
+                    else:
+                        logging.warning(f"⚠️ Hashtag '{tag}' non reconnu comme préférence.")
+
+        # Suppression des vidéos validées
+        logging.info("🗑️ Suppression des vidéos validées de profil_scrapping_video...")
+        cursor.execute("""
+            DELETE FROM profil_scrapping_video
+            WHERE validation = 'true'
+        """)
+        logging.info("🗑️ Vidéos validées supprimées de profil_scrapping_video.")
+
         connection.commit()
         logging.info("✅ Toutes les vidéos ont été traitées.")
 
@@ -172,7 +202,7 @@ def process_validated_scrapping_videos(conn_id='my_postgres'):
 with DAG(
     dag_id="download_tiktok_video_dag",
     start_date=datetime(2024, 1, 1),
-    schedule_interval=None,
+    schedule_interval="0 22 * * *",  # Tous les jours à 22h
     catchup=False,
     tags=["tiktok", "video", "download"],
 ) as dag:
