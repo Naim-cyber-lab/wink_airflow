@@ -118,7 +118,7 @@ def process_validated_scrapping_videos(conn_id='my_postgres'):
         cursor = connection.cursor()
 
         cursor.execute("""
-            SELECT id, bio, video, adresse, site_web, site_reservation, validation,
+            SELECT id, bio, video, addresse, site_web, site_reservation, validation,
                    code_postal, region, titre, hastags
             FROM profil_scrapping_video
             WHERE validation = 'true'
@@ -128,7 +128,7 @@ def process_validated_scrapping_videos(conn_id='my_postgres'):
 
         for row in rows:
             logging.info(f"🔍 Traitement de la ligne : {row}")
-            (_id, bio, video_url, adresse, site_web, site_reservation, validation,
+            (_id, bio, video_url, addresse, site_web, site_reservation, validation,
              code_postal, region, titre, hashtags) = row
 
             logging.info(f"➡️ Traitement de l’entrée ID={_id} : {titre}")
