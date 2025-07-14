@@ -141,7 +141,7 @@ def process_validated_scrapping_videos(conn_id='my_postgres'):
                 VALUES (%s, %s, %s, %s, %s, %s, %s, creatorWinkerId)
                 RETURNING id
             """, (
-                titre, adresse, region, region, code_postal, bio, site_web, creatorWinkerId
+                titre, addresse, region, region, code_postal, bio, site_web, creatorWinkerId
             ))
             event_id = cursor.fetchone()[0]
             logging.info(f"🆕 Nouvel event ID={event_id} créé.")
