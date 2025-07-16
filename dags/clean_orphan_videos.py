@@ -19,6 +19,9 @@ default_args = {
 def clean_orphan_videos():
     logging.info("🚀 Début de la tâche : suppression des vidéos orphelines.")
 
+    # Extensions vidéo autorisées
+    video_extensions = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv"}
+
     # Connexion DB via Airflow
     logging.info(f"🔌 Connexion à la base via la connexion Airflow : {DB_CONN_ID}")
     conn = BaseHook.get_connection(DB_CONN_ID)
@@ -33,32 +36,36 @@ def clean_orphan_videos():
         )
         cursor = connection.cursor()
 
-        # Récupération des chemins de fichiers vidéo en base
-        logging.info("📥 Récupération des fichiers présents dans la table profil_filesevent...")
+        # Récupération des fichiers référencés
+        logging.info("📥 Récupération des fichiers en base (profil_filesevent)...")
         cursor.execute("SELECT video FROM profil_filesevent;")
         rows = cursor.fetchall()
         db_files = set(row[0] for row in rows)
-        logging.info(f"✅ {len(db_files)} fichiers trouvés en base.")
+        logging.info(f"✅ {len(db_files)} fichiers en base.")
 
-        # Fichiers réellement présents dans le volume
+        # Fichiers présents localement
         logging.info(f"📂 Lecture du répertoire : {VIDEOS_PATH}")
         local_files = set(os.listdir(VIDEOS_PATH))
         logging.info(f"📁 {len(local_files)} fichiers trouvés localement.")
 
-        # Détection des fichiers orphelins
+        # Orphelins = fichiers locaux non référencés en base
         orphan_files = local_files - db_files
-        logging.info(f"🕵️‍♂️ {len(orphan_files)} fichiers orphelins détectés : {orphan_files}")
+        logging.info(f"🕵️‍♂️ {len(orphan_files)} fichiers orphelins détectés.")
+
+        # Filtrage par extension vidéo
+        orphan_videos = [f for f in orphan_files if os.path.splitext(f)[1].lower() in video_extensions]
+        logging.info(f"🎞️ {len(orphan_videos)} orphelins sont bien des vidéos : {orphan_videos}")
 
         # Suppression
-        for file in orphan_files:
+        for file in orphan_videos:
             file_path = os.path.join(VIDEOS_PATH, file)
             try:
-                #os.remove(file_path)
-                logging.info(f"🧹 Fichier supprimé : {file}")
+                # os.remove(file_path)
+                logging.info(f"🧹 Vidéo supprimée : {file}")
             except Exception as e:
                 logging.error(f"❌ Erreur en supprimant {file} : {e}")
 
-        logging.info("✅ Tâche terminée avec succès.")
+        logging.info("✅ Tâche de nettoyage terminée.")
 
     except Exception as e:
         logging.error(f"❌ Erreur globale dans le DAG : {e}")
