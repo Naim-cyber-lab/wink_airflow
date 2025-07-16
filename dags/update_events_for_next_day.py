@@ -139,11 +139,11 @@ def update_events(**kwargs):
             logging.info(f"🔎 {len(candidates)} événements anciens disponibles pour {region}.")
 
             for (event_id,) in candidates:
-                # cursor.execute("""
-                #     UPDATE profil_event
-                #     SET "datePublication" = %s
-                #     WHERE id = %s
-                # """, (tomorrow, event_id))
+                cursor.execute("""
+                    UPDATE profil_event
+                    SET "datePublication" = %s
+                    WHERE id = %s
+                """, (tomorrow, event_id))
                 logging.info(f"✅ Event ID {event_id} modifié pour publication le {tomorrow}")
                 total_updated += 1
 
