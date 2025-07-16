@@ -53,7 +53,7 @@ def clean_orphan_videos():
         for file in orphan_files:
             file_path = os.path.join(VIDEOS_PATH, file)
             try:
-                os.remove(file_path)
+                #os.remove(file_path)
                 logging.info(f"🧹 Fichier supprimé : {file}")
             except Exception as e:
                 logging.error(f"❌ Erreur en supprimant {file} : {e}")
