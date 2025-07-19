@@ -16,7 +16,7 @@ WITH expired_conversations AS (
 -- Étape 2 : Identifier les messages liés
 expired_messages AS (
     SELECT id FROM profil_conversationactivitymessages
-    WHERE "conversationactivity_id" IN (SELECT id FROM expired_conversations)
+    WHERE "conversationActivity_id" IN (SELECT id FROM expired_conversations)
 ),
 
 -- Étape 3 : Identifier les sondages liés
@@ -29,31 +29,47 @@ expired_polls AS (
 expired_poll_options AS (
     SELECT id FROM profil_polloptionconversation
     WHERE poll_id IN (SELECT id FROM expired_polls)
-)
+),
 
 -- Supprimer les votes liés aux options
-DELETE FROM profil_voteconversation
-WHERE poll_option_id IN (SELECT id FROM expired_poll_options);
+deleted_votes AS (
+    DELETE FROM profil_voteconversation
+    WHERE poll_option_id IN (SELECT id FROM expired_poll_options)
+    RETURNING 1
+),
 
 -- Supprimer les options des sondages
-DELETE FROM profil_poll_optionconversation
-WHERE id IN (SELECT id FROM expired_poll_options);
+deleted_poll_options AS (
+    DELETE FROM profil_polloptionconversation
+    WHERE id IN (SELECT id FROM expired_poll_options)
+    RETURNING 1
+),
 
 -- Supprimer les sondages
-DELETE FROM profil_pollconversation
-WHERE id IN (SELECT id FROM expired_polls);
+deleted_polls AS (
+    DELETE FROM profil_pollconversation
+    WHERE id IN (SELECT id FROM expired_polls)
+    RETURNING 1
+),
 
 -- Supprimer les messages
-DELETE FROM profil_conversationactivitymessages
-WHERE id IN (SELECT id FROM expired_messages);
+deleted_messages AS (
+    DELETE FROM profil_conversationactivitymessages
+    WHERE id IN (SELECT id FROM expired_messages)
+    RETURNING 1
+),
 
 -- Supprimer les participations
-DELETE FROM profil_participantconversationactivity
-WHERE "conversationactivity_id" IN (SELECT id FROM expired_conversations);
+deleted_participants AS (
+    DELETE FROM profil_participantconversationactivity
+    WHERE "conversationActivity_id" IN (SELECT id FROM expired_conversations)
+    RETURNING 1
+)
 
 -- Supprimer les conversations
 DELETE FROM profil_conversationactivity
 WHERE id IN (SELECT id FROM expired_conversations);
+
 """
 
 with DAG(
