@@ -126,7 +126,7 @@ def process_validated_scrapping_videos(conn_id='my_postgres'):
         rows = cursor.fetchall()
         logging.info(f"📦 {len(rows)} vidéos validées à traiter.")
 
-        for row in rows[0:2]:
+        for row in rows:
             logging.info(f"🔍 Traitement de la ligne : {row}")
             (_id, bio, video_url, addresse, site_web, site_reservation, validation,
              code_postal, region, titre, hashtags) = row
