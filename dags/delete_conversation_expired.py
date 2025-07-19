@@ -64,6 +64,13 @@ deleted_participants AS (
     DELETE FROM profil_participantconversationactivity
     WHERE "conversationActivity_id" IN (SELECT id FROM expired_conversations)
     RETURNING 1
+),
+
+-- 🔥 Supprimer les préférences liées
+deleted_preferences AS (
+    DELETE FROM profil_preference
+    WHERE "conversation_id" IN (SELECT id FROM expired_conversations)
+    RETURNING 1
 )
 
 -- Supprimer les conversations
