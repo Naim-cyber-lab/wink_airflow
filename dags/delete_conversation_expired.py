@@ -7,57 +7,53 @@ default_args = {
     "retries": 1,
 }
 
-# Requête SQL complète pour supprimer les conversations expirées et tout ce qui s’y rattache
 SQL_DELETE_EXPIRED_CONVERSATIONS = """
--- Supprimer tous les votes liés aux options des sondages
-DELETE FROM vote_conversation
-WHERE poll_option_id IN (
-    SELECT id FROM poll_option_conversation
-    WHERE poll_id IN (
-        SELECT poll.id
-        FROM poll_conversation AS poll
-        JOIN conversation_activity_messages AS msg ON poll.conversation_activity_message_id = msg.id
-        JOIN conversation_activity AS conv ON msg.conversationactivity_id = conv.id
-        WHERE conv.date < NOW()
-    )
-);
+-- Étape 1 : Identifier les conversations expirées
+WITH expired_conversations AS (
+    SELECT id FROM profil_conversation_activity WHERE date < NOW()
+),
+
+-- Étape 2 : Identifier les messages liés
+expired_messages AS (
+    SELECT id FROM profil_conversation_activity_messages
+    WHERE conversationactivity_id IN (SELECT id FROM expired_conversations)
+),
+
+-- Étape 3 : Identifier les sondages liés
+expired_polls AS (
+    SELECT id FROM profil_poll_conversation
+    WHERE conversation_activity_message_id IN (SELECT id FROM expired_messages)
+),
+
+-- Étape 4 : Identifier les options de sondages liés
+expired_poll_options AS (
+    SELECT id FROM profil_poll_option_conversation
+    WHERE poll_id IN (SELECT id FROM expired_polls)
+)
+
+-- Supprimer les votes liés aux options
+DELETE FROM profil_vote_conversation
+WHERE poll_option_id IN (SELECT id FROM expired_poll_options);
 
 -- Supprimer les options des sondages
-DELETE FROM poll_option_conversation
-WHERE poll_id IN (
-    SELECT poll.id
-    FROM poll_conversation AS poll
-    JOIN conversation_activity_messages AS msg ON poll.conversation_activity_message_id = msg.id
-    JOIN conversation_activity AS conv ON msg.conversationactivity_id = conv.id
-    WHERE conv.date < NOW()
-);
+DELETE FROM profil_poll_option_conversation
+WHERE id IN (SELECT id FROM expired_poll_options);
 
 -- Supprimer les sondages
-DELETE FROM poll_conversation
-WHERE conversation_activity_message_id IN (
-    SELECT msg.id
-    FROM conversation_activity_messages AS msg
-    JOIN conversation_activity AS conv ON msg.conversationactivity_id = conv.id
-    WHERE conv.date < NOW()
-);
+DELETE FROM profil_poll_conversation
+WHERE id IN (SELECT id FROM expired_polls);
 
--- Supprimer les messages liés aux conversations expirées
-DELETE FROM conversation_activity_messages
-WHERE conversationactivity_id IN (
-    SELECT id FROM conversation_activity
-    WHERE date < NOW()
-);
+-- Supprimer les messages
+DELETE FROM profil_conversation_activity_messages
+WHERE id IN (SELECT id FROM expired_messages);
 
 -- Supprimer les participations
-DELETE FROM participant_conversation_activity
-WHERE conversationactivity_id IN (
-    SELECT id FROM conversation_activity
-    WHERE date < NOW()
-);
+DELETE FROM profil_participant_conversation_activity
+WHERE conversationactivity_id IN (SELECT id FROM expired_conversations);
 
--- Supprimer les conversations elles-mêmes
-DELETE FROM conversation_activity
-WHERE date < NOW();
+-- Supprimer les conversations
+DELETE FROM profil_conversation_activity
+WHERE id IN (SELECT id FROM expired_conversations);
 """
 
 with DAG(
@@ -70,7 +66,7 @@ with DAG(
 
     delete_expired_conversations_task = PostgresOperator(
         task_id="delete_expired_conversations_task",
-        postgres_conn_id="my_postgres",  # à adapter si différent
+        postgres_conn_id="my_postgres",  # adapte le nom de la connexion si besoin
         sql=SQL_DELETE_EXPIRED_CONVERSATIONS,
     )
 
