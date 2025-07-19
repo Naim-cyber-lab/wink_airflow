@@ -16,13 +16,13 @@ WITH expired_conversations AS (
 -- Étape 2 : Identifier les messages liés
 expired_messages AS (
     SELECT id FROM profil_conversationactivitymessages
-    WHERE conversationactivity_id IN (SELECT id FROM expired_conversations)
+    WHERE "conversationactivity_id" IN (SELECT id FROM expired_conversations)
 ),
 
 -- Étape 3 : Identifier les sondages liés
 expired_polls AS (
     SELECT id FROM profil_pollconversation
-    WHERE conversation_activity_message_id IN (SELECT id FROM expired_messages)
+    WHERE "conversation_activity_message_id" IN (SELECT id FROM expired_messages)
 ),
 
 -- Étape 4 : Identifier les options de sondages liés
@@ -49,7 +49,7 @@ WHERE id IN (SELECT id FROM expired_messages);
 
 -- Supprimer les participations
 DELETE FROM profil_participantconversationactivity
-WHERE conversationactivity_id IN (SELECT id FROM expired_conversations);
+WHERE "conversationactivity_id" IN (SELECT id FROM expired_conversations);
 
 -- Supprimer les conversations
 DELETE FROM profil_conversationactivity
