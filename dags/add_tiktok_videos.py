@@ -23,7 +23,6 @@ def check_raw_video_codec(path):
     logging.info(f"🎥 Codec de la vidéo brute ({path}) : {codec}")
     return codec
 
-
 def download_and_prepare_tiktok_video(url, output_dir="/opt/airflow/videos"):
     os.makedirs(output_dir, exist_ok=True)
     video_id = str(uuid.uuid4())
@@ -64,7 +63,6 @@ def download_and_prepare_tiktok_video(url, output_dir="/opt/airflow/videos"):
 
     return final_path
 
-
 def insert_video_into_django_db(video_path, event_id=1, conn_id='my_postgres'):
     logging.info(f"📥 Insertion d'une nouvelle ligne pour l'event {event_id}")
     conn = BaseHook.get_connection(conn_id)
@@ -95,7 +93,6 @@ def insert_video_into_django_db(video_path, event_id=1, conn_id='my_postgres'):
     finally:
         cursor.close()
         connection.close()
-
 
 def run_tiktok_download():
     url = "https://www.tiktok.com/@sofiaosaoncamara/video/7352841442324221217"
@@ -159,33 +156,42 @@ def process_validated_scrapping_videos(conn_id='my_postgres'):
             logging.info(f"🎥 Vidéo insérée pour l'event ID={event_id}")
 
             # Insertion des hashtags associés
-            logging.info("🏷️ Insertion des préférences ( hastags ) associées...")
-            if hashtags:
-                hashtag_list = [tag.strip() for tag in hashtags.split(',') if tag.strip()]
-                for tag in hashtag_list:
-                    if tag in [
-                        "Sport", "Party", "NoRestriction_Food", "Halal", "Cacher", "Vegan",
-                        "Culture", "EGame", "Bar", "Free_Activities", "Games_Play",
-                        "Trip", "Humanitary", "TouristAttraction", "Attraction", "Other"
-                    ]:
-                        # Construction dynamique de la requête avec la colonne correspondante à True
-                        cursor.execute(
-                            f"""
-                            INSERT INTO profil_preference (event_id, "{tag}")
-                            VALUES (%s, TRUE)
-                            """,
-                            (event_id,)
-                        )
-                        logging.info(f"✅ Préférence '{tag}' insérée pour l'event ID={event_id}")
-                    else:
-                        logging.warning(f"⚠️ Hashtag '{tag}' non reconnu comme préférence.")
+            logging.info("🏷️ Insertion des préférences ( hashtags ) associées...")
+            PREFERENCE_TAGS = [
+                "Sport", "Party", "NoRestriction_Food", "Halal", "Cacher", "Vegan",
+                "Culture", "EGame", "Bar", "Free_Activities", "Games_Play",
+                "Trip", "Humanitary", "TouristAttraction", "Attraction", "Other"
+            ]
 
+            # Initialise tous les tags à False
+            prefs = {tag: False for tag in PREFERENCE_TAGS}
+
+            if hashtags:
+                for tag in [t.strip() for t in hashtags.split(',') if t.strip()]:
+                    if tag in prefs:
+                        prefs[tag] = True
+                        logging.info(f"✅ Préférence '{tag}' activée")
+                    else:
+                        logging.warning(f"⚠️ Hashtag non reconnu : '{tag}'")
+
+            # Génère la requête SQL dynamiquement
+            columns = ", ".join([f'"{tag}"' for tag in prefs])
+            placeholders = ", ".join(["%s"] * len(prefs))
+
+            sql = f"""
+                INSERT INTO profil_preference (event_id, {columns})
+                VALUES (%s, {placeholders})
+            """
+
+            values = [event_id] + list(prefs.values())
+            cursor.execute(sql, values)
+            logging.info(f"✅ Préférences insérées pour l'event ID={event_id}")
         # Suppression des vidéos validées
         logging.info("🗑️ Suppression des vidéos validées de profil_scrapping_video...")
-        cursor.execute("""
-            DELETE FROM profil_scrapping_video
-            WHERE validation = 'true'
-        """)
+        # cursor.execute("""
+        #     DELETE FROM profil_scrapping_video
+        #     WHERE validation = 'true'
+        # """)
         logging.info("🗑️ Vidéos validées supprimées de profil_scrapping_video.")
 
         connection.commit()
@@ -197,7 +203,6 @@ def process_validated_scrapping_videos(conn_id='my_postgres'):
     finally:
         cursor.close()
         connection.close()
-
 
 with DAG(
     dag_id="download_tiktok_video_dag",
