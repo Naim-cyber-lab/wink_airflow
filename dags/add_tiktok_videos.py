@@ -124,68 +124,66 @@ def process_validated_scrapping_videos(conn_id='my_postgres'):
         logging.info(f"📦 {len(rows)} vidéos validées à traiter.")
 
         for row in rows:
-            logging.info(f"🔍 Traitement de la ligne : {row}")
-            (_id, bio, video_url, addresse, site_web, site_reservation, validation,
-             code_postal, region, titre, hashtags) = row
+            try:
+                logging.info(f"🔍 Traitement de la ligne : {row}")
+                (_id, bio, video_url, addresse, site_web, site_reservation, validation,
+                 code_postal, region, titre, hashtags) = row
 
-            logging.info(f"➡️ Traitement de l’entrée ID={_id} : {titre}")
+                logging.info(f"➡️ Traitement de l’entrée ID={_id} : {titre}")
 
-            creatorWinkerId = 116  # ID du créateur Winker( nacim.souni@outlook.fr )
+                creatorWinkerId = 116
 
-            # Création de l'event
-            cursor.execute("""
-                INSERT INTO profil_event (titre, adresse, region, city, "codePostal", "bioEvent", website, "creatorWinker_id")
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
-            """, (
-                titre, addresse, region, region, code_postal, bio, site_web, creatorWinkerId
-            ))
+                # Création de l'event
+                cursor.execute("""
+                    INSERT INTO profil_event (titre, adresse, region, city, "codePostal", "bioEvent", website, "creatorWinker_id")
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                """, (
+                    titre, addresse, region, region, code_postal, bio, site_web, creatorWinkerId
+                ))
 
-            event_id = cursor.fetchone()[0]
-            logging.info(f"🆕 Nouvel event ID={event_id} créé.")
+                event_id = cursor.fetchone()[0]
+                logging.info(f"🆕 Nouvel event ID={event_id} créé.")
 
-            # Télécharger et convertir la vidéo
-            final_path = download_and_prepare_tiktok_video(video_url)
-            relative_path = final_path.replace("/opt/airflow/videos/", "")
+                # Télécharger la vidéo
+                final_path = download_and_prepare_tiktok_video(video_url)
+                relative_path = final_path.replace("/opt/airflow/videos/", "")
 
-            # Insertion de la vidéo liée
-            cursor.execute("""
-                INSERT INTO profil_filesevent (event_id, video, image)
-                VALUES (%s, %s, NULL)
-            """, (event_id, relative_path))
-            logging.info(f"🎥 Vidéo insérée pour l'event ID={event_id}")
+                # Insert vidéo
+                cursor.execute("""
+                    INSERT INTO profil_filesevent (event_id, video, image)
+                    VALUES (%s, %s, NULL)
+                """, (event_id, relative_path))
+                logging.info(f"🎥 Vidéo insérée pour l'event ID={event_id}")
 
-            # Insertion des hashtags associés
-            logging.info("🏷️ Insertion des préférences ( hashtags ) associées...")
-            PREFERENCE_TAGS = [
-                "Sport", "Party", "NoRestriction_Food", "Halal", "Cacher", "Vegan",
-                "Culture", "EGame", "Bar", "Free_Activities", "Games_Play",
-                "Trip", "Humanitary", "TouristAttraction", "Attraction", "Other"
-            ]
+                # Préférences
+                logging.info("🏷️ Insertion des préférences ( hashtags ) associées...")
+                PREFERENCE_TAGS = [
+                    "Sport", "Party", "NoRestriction_Food", "Halal", "Cacher", "Vegan",
+                    "Culture", "EGame", "Bar", "Free_Activities", "Games_Play",
+                    "Trip", "Humanitary", "TouristAttraction", "Attraction", "Other"
+                ]
 
-            # Initialise tous les tags à False
-            prefs = {tag: False for tag in PREFERENCE_TAGS}
+                prefs = {tag: False for tag in PREFERENCE_TAGS}
+                if hashtags:
+                    for tag in [t.strip() for t in hashtags.split(',') if t.strip()]:
+                        if tag in prefs:
+                            prefs[tag] = True
+                            logging.info(f"✅ Préférence '{tag}' activée")
+                        else:
+                            logging.warning(f"⚠️ Hashtag non reconnu : '{tag}'")
 
-            if hashtags:
-                for tag in [t.strip() for t in hashtags.split(',') if t.strip()]:
-                    if tag in prefs:
-                        prefs[tag] = True
-                        logging.info(f"✅ Préférence '{tag}' activée")
-                    else:
-                        logging.warning(f"⚠️ Hashtag non reconnu : '{tag}'")
+                columns = ", ".join([f'"{tag}"' for tag in prefs])
+                placeholders = ", ".join(["%s"] * len(prefs))
+                sql = f"""INSERT INTO profil_preference (event_id, {columns}) VALUES (%s, {placeholders})"""
+                values = [event_id] + list(prefs.values())
+                cursor.execute(sql, values)
+                logging.info(f"✅ Préférences insérées pour l'event ID={event_id}")
 
-            # Génère la requête SQL dynamiquement
-            columns = ", ".join([f'"{tag}"' for tag in prefs])
-            placeholders = ", ".join(["%s"] * len(prefs))
+            except Exception as e:
+                logging.error(f"❌ Erreur sur ID={row[0]} : {e}")
+                continue
 
-            sql = f"""
-                INSERT INTO profil_preference (event_id, {columns})
-                VALUES (%s, {placeholders})
-            """
-
-            values = [event_id] + list(prefs.values())
-            cursor.execute(sql, values)
-            logging.info(f"✅ Préférences insérées pour l'event ID={event_id}")
         # Suppression des vidéos validées
         logging.info("🗑️ Suppression des vidéos validées de profil_scrapping_video...")
         # cursor.execute("""
