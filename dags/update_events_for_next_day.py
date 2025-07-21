@@ -130,7 +130,7 @@ def update_events(**kwargs):
 
             cursor.execute("""
                     SELECT id FROM profil_event
-                    WHERE "dateEvent" IS NULL AND region = %s AND active = 0
+                    WHERE "dateEvent" IS NULL AND region = %s AND (active = 0 OR active IS NULL)
                     ORDER BY "datePublication" ASC NULLS FIRST
                     LIMIT %s
             """, (region, to_add))
