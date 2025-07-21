@@ -133,7 +133,7 @@ def update_events(**kwargs):
                     WHERE "dateEvent" IS NULL AND region = %s AND active = 0
                     ORDER BY "datePublication" ASC NULLS FIRST
                     LIMIT %s
-            """, (tomorrow, region, to_add))
+            """, (region, to_add))
 
             candidates = cursor.fetchall()
             logging.info(f"🔎 {len(candidates)} événements anciens disponibles pour {region}.")
