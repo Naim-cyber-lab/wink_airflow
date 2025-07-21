@@ -129,10 +129,10 @@ def update_events(**kwargs):
             logging.info(f"📂 Traitement de la région : {region} (événements à ajouter : {to_add})")
 
             cursor.execute("""
-                SELECT id FROM profil_event
-                WHERE "datePublication" < %s AND "dateEvent" IS NULL AND region = %s
-                ORDER BY "datePublication" ASC
-                LIMIT %s
+                    SELECT id FROM profil_event
+                    WHERE "dateEvent" IS NULL AND region = %s AND active = 0
+                    ORDER BY "datePublication" ASC NULLS FIRST
+                    LIMIT %s
             """, (tomorrow, region, to_add))
 
             candidates = cursor.fetchall()
@@ -141,7 +141,7 @@ def update_events(**kwargs):
             for (event_id,) in candidates:
                 cursor.execute("""
                     UPDATE profil_event
-                    SET "datePublication" = %s
+                    SET "datePublication" = %s,  active = 1
                     WHERE id = %s
                 """, (tomorrow, event_id))
                 logging.info(f"✅ Event ID {event_id} modifié pour publication le {tomorrow}")

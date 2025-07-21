@@ -33,7 +33,7 @@ def nullify_old_publications(**kwargs):
         cursor = connection.cursor()
         cursor.execute("""
             UPDATE profil_event
-            SET "datePublication" = NULL
+            SET "active" = 0
             WHERE "datePublication"::date >= %s
               AND "datePublication"::date < %s
         """, (start_date, end_date))
