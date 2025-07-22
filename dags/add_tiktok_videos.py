@@ -9,6 +9,33 @@ import yt_dlp
 import logging
 import psycopg2
 
+import requests
+
+def get_lat_lon(address: str, postal_code: str, region: str, country: str = "France"):
+    query = f"{address}, {postal_code}, {region}, {country}"
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {
+        "q": query,
+        "format": "json",
+        "limit": 1,
+    }
+    headers = {
+        "User-Agent": "airflow-geocoder/1.0"
+    }
+
+    try:
+        response = requests.get(url, params=params, headers=headers, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        if data:
+            lat = float(data[0]['lat'])
+            lon = float(data[0]['lon'])
+            return lat, lon
+        else:
+            return None, None
+    except Exception as e:
+        logging.warning(f"🌍 Échec géocodage pour {query} : {e}")
+        return None, None
 
 def check_raw_video_codec(path):
     cmd = [
@@ -116,7 +143,7 @@ def process_validated_scrapping_videos(conn_id='my_postgres'):
 
         cursor.execute("""
             SELECT id, bio, video, addresse, site_web, site_reservation, validation,
-                   code_postal, region, titre, hastags
+                   code_postal, region, titre, hastags, ville
             FROM profil_scrapping_video
             WHERE validation = 'true'
         """)
@@ -127,20 +154,29 @@ def process_validated_scrapping_videos(conn_id='my_postgres'):
             try:
                 logging.info(f"🔍 Traitement de la ligne : {row}")
                 (_id, bio, video_url, addresse, site_web, site_reservation, validation,
-                 code_postal, region, titre, hashtags) = row
+                 code_postal, region, titre, hashtags, ville) = row
 
                 logging.info(f"➡️ Traitement de l’entrée ID={_id} : {titre}")
 
                 creatorWinkerId = 116
                 active = 0
+                maxNumberParticipant = 10000000
+
+                lat, lon = get_lat_lon(addresse, code_postal, region)
+                logging.info(f"📍 Coordonnées trouvées : lat={lat}, lon={lon}")
 
                 # Création de l'event
                 cursor.execute("""
-                    INSERT INTO profil_event (titre, adresse, region, city, "codePostal", "bioEvent", website, "creatorWinker_id", active)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO profil_event (
+                        titre, adresse, region, city, "codePostal",
+                        "bioEvent", website, "creatorWinker_id", active,
+                        lat, lon, "maxNumberParticipant"
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                 """, (
-                    titre, addresse, region, region, code_postal, bio, site_web, creatorWinkerId, active
+                    titre, addresse, region, ville, code_postal,
+                    bio, site_web, creatorWinkerId, active,
+                    lat, lon, maxNumberParticipant
                 ))
 
                 event_id = cursor.fetchone()[0]
@@ -192,6 +228,14 @@ def process_validated_scrapping_videos(conn_id='my_postgres'):
         #     WHERE validation = 'true'
         # """)
         logging.info("🗑️ Vidéos validées supprimées de profil_scrapping_video.")
+        # Marquer les vidéos comme traitées
+        logging.info("✅ Mise à jour du statut : validation → done_true...")
+        cursor.execute("""
+            UPDATE profil_scrapping_video
+            SET validation = 'done_true'
+            WHERE validation = 'true'
+        """)
+        logging.info("✅ Statut mis à jour pour les vidéos traitées.")
 
         connection.commit()
         logging.info("✅ Toutes les vidéos ont été traitées.")
