@@ -60,7 +60,7 @@ def get_published_events(**kwargs):
         cursor.execute("""
             SELECT region, COUNT(*)
             FROM profil_event
-            WHERE "datePublication" = %s
+            WHERE "datePublication" = %s AND active = 1
             GROUP BY region
         """, (tomorrow,))
         published = {row[0]: row[1] for row in cursor.fetchall()}
