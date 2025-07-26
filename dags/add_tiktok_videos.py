@@ -165,18 +165,20 @@ def process_validated_scrapping_videos(conn_id='my_postgres'):
                 lat, lon = get_lat_lon(addresse, code_postal, region)
                 logging.info(f"📍 Coordonnées trouvées : lat={lat}, lon={lon}")
 
+                accessComment = True
+
                 # Création de l'event
                 cursor.execute("""
                     INSERT INTO profil_event (
                         titre, adresse, region, city, "codePostal",
                         "bioEvent", website, "creatorWinker_id", active,
-                        lat, lon, "maxNumberParticipant"
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        lat, lon, "maxNumberParticipant", "accessComment"
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                 """, (
                     titre, addresse, region, ville, code_postal,
                     bio, site_web, creatorWinkerId, active,
-                    lat, lon, maxNumberParticipant
+                    lat, lon, maxNumberParticipant, accessComment
                 ))
 
                 event_id = cursor.fetchone()[0]
