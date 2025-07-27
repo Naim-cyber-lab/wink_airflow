@@ -44,30 +44,40 @@ def get_target_per_region(**kwargs):
 
 
 def get_published_events(**kwargs):
+    from datetime import datetime, timedelta
+    import logging
+    import psycopg2
+    from airflow.hooks.base import BaseHook
+
     ti = kwargs['ti']
     tomorrow = (datetime.now() + timedelta(days=1)).date()
-    logging.info(f"📦 [get_published_events] Vérification des événements avec datePublication = {tomorrow}")
+    logging.info(f"📦 [get_published_events] Vérification des événements avec datePublication = {tomorrow.isoformat()}")
     try:
         conn = BaseHook.get_connection(DB_CONN_ID)
-        connection = psycopg2.connect(
-            host=conn.host,
-            port=conn.port,
-            user=conn.login,
-            password=conn.password,
-            dbname=conn.schema
-        )
-        cursor = connection.cursor()
-        cursor.execute("""
-            SELECT region, COUNT(*)
-            FROM profil_event
-            WHERE "datePublication" = %s AND active = 1
-            GROUP BY region
-        """, (tomorrow,))
-        published = {row[0]: row[1] for row in cursor.fetchall()}
-        logging.info(f"✅ Événements déjà publiés demain par région : {published}")
-        cursor.close()
-        connection.close()
-        ti.xcom_push(key='published', value=published)
+        with psycopg2.connect(
+                host=conn.host,
+                port=conn.port,
+                user=conn.login,
+                password=conn.password,
+                dbname=conn.schema
+        ) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    UPDATE profil_event
+                    SET active = 1
+                    WHERE "datePublication" = %s
+                """, (tomorrow,))
+                connection.commit()
+
+                cursor.execute("""
+                    SELECT region, COUNT(*)
+                    FROM profil_event
+                    WHERE "datePublication" = %s AND active = 1
+                    GROUP BY region
+                """, (tomorrow,))
+                published = {row[0]: row[1] for row in cursor.fetchall()}
+                logging.info(f"✅ Événements déjà publiés demain par région : {published}")
+                ti.xcom_push(key='published', value=published)
     except Exception as e:
         logging.error(f"❌ Erreur dans get_published_events : {e}")
         raise
