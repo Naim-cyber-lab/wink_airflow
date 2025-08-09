@@ -42,7 +42,6 @@ def get_target_per_region(**kwargs):
         logging.error(f"❌ Erreur dans get_target_per_region : {e}")
         raise
 
-
 def get_published_events(**kwargs):
     from datetime import datetime, timedelta
     import logging
@@ -52,16 +51,18 @@ def get_published_events(**kwargs):
     ti = kwargs['ti']
     tomorrow = (datetime.now() + timedelta(days=1)).date()
     logging.info(f"📦 [get_published_events] Vérification des événements avec datePublication = {tomorrow.isoformat()}")
+
     try:
         conn = BaseHook.get_connection(DB_CONN_ID)
         with psycopg2.connect(
-                host=conn.host,
-                port=conn.port,
-                user=conn.login,
-                password=conn.password,
-                dbname=conn.schema
+            host=conn.host,
+            port=conn.port,
+            user=conn.login,
+            password=conn.password,
+            dbname=conn.schema
         ) as connection:
             with connection.cursor() as cursor:
+                # Active tout ce qui est prévu pour demain
                 cursor.execute("""
                     UPDATE profil_event
                     SET active = 1
@@ -69,19 +70,27 @@ def get_published_events(**kwargs):
                 """, (tomorrow,))
                 connection.commit()
 
+                # Compte par région, en forçant la présence de toutes les régions cibles
                 cursor.execute("""
-                    SELECT region, COUNT(*)
-                    FROM profil_event
-                    WHERE "datePublication" = %s AND active = 1
-                    GROUP BY region
+                    SELECT t.config_one AS region, COALESCE(COUNT(e.*), 0) AS cnt
+                    FROM profil_nisu_param_config t
+                    LEFT JOIN profil_event e
+                      ON e.region = t.config_one
+                     AND e."datePublication" = %s
+                     AND e.active = 1
+                    WHERE t.perimeter = 'video'
+                    GROUP BY t.config_one
+                    ORDER BY t.config_one
                 """, (tomorrow,))
-                published = {row[0]: row[1] for row in cursor.fetchall()}
-                logging.info(f"✅ Événements déjà publiés demain par région : {published}")
+
+                published = {row[0]: int(row[1]) for row in cursor.fetchall()}
+
+                logging.info(f"✅ Événements déjà publiés demain par région (avec zéros) : {published}")
                 ti.xcom_push(key='published', value=published)
+
     except Exception as e:
         logging.error(f"❌ Erreur dans get_published_events : {e}")
         raise
-
 
 def compute_missing_events(**kwargs):
     ti = kwargs['ti']
@@ -112,7 +121,6 @@ def compute_missing_events(**kwargs):
     except Exception as e:
         logging.error(f"❌ Erreur dans compute_missing_events : {e}")
         raise
-
 
 def update_events(**kwargs):
     ti = kwargs['ti']
@@ -166,7 +174,6 @@ def update_events(**kwargs):
     except Exception as e:
         logging.error(f"❌ Erreur dans update_events : {e}")
         raise
-
 
 with DAG(
     dag_id="update_events_for_next_day_xcom",
