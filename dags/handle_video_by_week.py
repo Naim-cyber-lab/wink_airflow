@@ -16,9 +16,8 @@ default_args = {
 def nullify_old_publications(**kwargs):
     execution_date = datetime.strptime(kwargs['ds'], "%Y-%m-%d")  # date d'exécution du DAG
     start_date = (execution_date - timedelta(days=14)).date()
-    end_date = (execution_date - timedelta(days=7)).date()
 
-    logging.info(f"🔍 Mise à null des datePublication entre {start_date} et {end_date}")
+    logging.info(f"🔍 Mise à null des datePublication inférieur à {start_date}")
 
     try:
         conn = BaseHook.get_connection(DB_CONN_ID)
@@ -34,9 +33,8 @@ def nullify_old_publications(**kwargs):
         cursor.execute("""
             UPDATE profil_event
             SET "active" = 0
-            WHERE "datePublication"::date >= %s
-              AND "datePublication"::date < %s
-        """, (start_date, end_date))
+            WHERE "datePublication" < CURRENT_DATE - INTERVAL '1 day';
+        """)
 
         affected = cursor.rowcount
         connection.commit()
