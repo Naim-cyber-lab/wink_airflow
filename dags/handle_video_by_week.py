@@ -7,6 +7,7 @@ from datetime import timedelta, date
 import pendulum
 import psycopg2
 import logging
+from airflow.utils.dates import days_ago
 
 # --- DOC Airflow: nullify_publication_last_week ------------------------------
 DAG_DOC = r"""
@@ -42,10 +43,8 @@ default_args = {
 }
 
 def nullify_old_publications(**kwargs):
-    execution_date = datetime.strptime(kwargs['ds'], "%Y-%m-%d")  # date d'exécution du DAG
-    start_date = (execution_date - timedelta(days=14)).date()
-
-    logging.info(f"🔍 Mise à null des datePublication inférieur à {start_date}")
+    execution_date = kwargs['logical_date']  # objet pendulum datetime
+    logging.info(f"🔍 DAG exécuté à {execution_date}")
 
     try:
         conn = BaseHook.get_connection(DB_CONN_ID)
@@ -76,7 +75,7 @@ with DAG(
     dag_id='nullify_publication_last_week',
     description='Met à NULL les datePublication de la semaine passée ( à J-7 )',
     schedule_interval='50 23 * * 0',  # chaque dimanche à 23h50
-    start_date=datetime(2024, 1, 1),
+    start_date=days_ago(1),
     catchup=False,
     default_args=default_args,
     tags=['cleanup', 'event', 'profil_event'],
