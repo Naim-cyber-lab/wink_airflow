@@ -6,6 +6,47 @@ from datetime import datetime, timedelta
 import psycopg2
 import logging
 
+# --- DOC Airflow: update_events_for_next_day_xcom ----------------------------
+DAG_DOC = r"""
+# 📆 Quotas de publication **J+1** par région
+
+**But**  
+Garantir, pour **demain**, un nombre minimal d’événements actifs **par région** :
+1. Active (`active = 1`) les événements déjà planifiés **demain**.  
+2. Compte par région les publications **demain**.  
+3. Compare aux **targets** (table `profil_nisu_param_config`).  
+4. Replanifie des événements « anciens » (sans `dateEvent`) vers **demain** pour combler le manque.
+
+**Planification**  
+- CRON : `0 1 * * *` (tous les jours à 01:00)  
+- `catchup = False`
+
+**Sources & Connexion**  
+- Connexion Airflow : **my_postgres**  
+- Tables :
+  - **profil_nisu_param_config** (targets par région) — filtre : `perimeter = 'video'`  
+    - champs utilisés : `config_one` (région), `float_param` (target)  
+  - **profil_event** — champs : `id`, `region`, `datePublication`, `dateEvent`, `active`
+
+**Pipeline (tâches)**  
+- `get_target_per_region` → lit les **targets** (dict `{region: target}`).  
+- `get_published_events` → **active** les events de demain, puis compte par région.  
+- `compute_missing_events` → `missing = max(target - published, 0)` par région.  
+- `update_events` → pour chaque région manquante :
+  - sélectionne des **candidats** : `dateEvent IS NULL` et `active IS NULL/0`  
+  - **priorise** ceux sans `datePublication` (NULL d’abord), limite au besoin  
+  - met `datePublication = demain` et `active = 1`.
+
+**Requêtes clés (extraits)**
+
+_Targets_ :
+```sql
+SELECT config_one AS region, float_param AS target
+FROM profil_nisu_param_config
+WHERE perimeter = 'video';
+```
+"""
+
 DB_CONN_ID = 'my_postgres'
 
 default_args = {
@@ -147,10 +188,13 @@ def update_events(**kwargs):
             logging.info(f"📂 Traitement de la région : {region} (événements à ajouter : {to_add})")
 
             cursor.execute("""
-                    SELECT id FROM profil_event
-                    WHERE "dateEvent" IS NULL AND region = %s AND (active = 0 OR active IS NULL)
-                    ORDER BY "datePublication" ASC NULLS FIRST
-                    LIMIT %s
+                    SELECT id
+                    FROM profil_event
+                    WHERE "dateEvent" IS NULL
+                      AND region = %s
+                      AND (active = 0 OR active IS NULL)
+                    ORDER BY "datePublication" IS NOT NULL, "datePublication" ASC
+                    LIMIT %s;
             """, (region, to_add))
 
             candidates = cursor.fetchall()
@@ -183,6 +227,7 @@ with DAG(
     default_args=default_args,
     tags=["event", "region", "xcom", "log"],
 ) as dag:
+    dag.doc_md = DAG_DOC
 
     t1 = PythonOperator(
         task_id="get_target_per_region",
