@@ -147,10 +147,13 @@ def update_events(**kwargs):
             logging.info(f"📂 Traitement de la région : {region} (événements à ajouter : {to_add})")
 
             cursor.execute("""
-                    SELECT id FROM profil_event
-                    WHERE "dateEvent" IS NULL AND region = %s AND (active = 0 OR active IS NULL)
-                    ORDER BY "datePublication" ASC NULLS FIRST
-                    LIMIT %s
+                    SELECT id
+                    FROM profil_event
+                    WHERE "dateEvent" IS NULL
+                      AND region = %s
+                      AND (active = 0 OR active IS NULL)
+                    ORDER BY "datePublication" IS NOT NULL, "datePublication" ASC
+                    LIMIT %s;
             """, (region, to_add))
 
             candidates = cursor.fetchall()
