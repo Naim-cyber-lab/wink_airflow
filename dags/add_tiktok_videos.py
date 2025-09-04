@@ -160,7 +160,7 @@ def process_validated_scrapping_videos(conn_id='my_postgres'):
 
                 creatorWinkerId = 116
                 active = 0
-                maxNumberParticipant = 10000000
+                maxNumberParticipant = 99999999
 
                 lat, lon = get_lat_lon(addresse, code_postal, region)
                 logging.info(f"📍 Coordonnées trouvées : lat={lat}, lon={lon}")
