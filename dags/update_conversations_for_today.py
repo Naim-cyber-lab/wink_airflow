@@ -1,4 +1,4 @@
-# dags/update_conversations_for_next_day.py
+# dags/update_conversations_for_today.py
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.hooks.base import BaseHook
@@ -16,26 +16,11 @@ default_args = {
 }
 
 DAG_DOC = r"""
-# 🔁 Rotation des **conversations** pour J+1 (par région)
+# 🔁 Rotation des **conversations** pour **aujourd'hui** (par région)
 
-**Objectif**
-- Pour **demain**, garantir un nombre cible de conversations publiées **par région** (targets dans `profil_nisu_param_config`, `perimeter='conversation'`).
-- Si une région est en dessous du quota, on repousse **les conversations les plus récentes** (priorité aux dernières, *roulement*) en mettant `datePublication = demain`.
-
-**Tables**
-- `profil_nisu_param_config` (targets par région)
-  - `perimeter='conversation'`, `config_one` = région, `float_param` = quota
-- `profil_conversationactivity`
-  - champs utilisés : `id`, `region`, `"datePublication"`
-
-**Plan**
-1) Lire les **targets** par région.
-2) Compter les conversations déjà planifiées pour **demain**.
-3) Calculer le **manque** `max(target - count, 0)`.
-4) Pour chaque région manquante, **réassigner** `datePublication = demain` aux conversations candidates, en **priorisant les plus récentes**:
-   - candidates: même région
-   - exclure celles déjà prévues demain
-   - ordre: `ORDER BY "datePublication" DESC NULLS FIRST, id DESC`
+Objectif
+- Garantir un nombre cible de conversations **aujourd'hui** par région (targets dans `profil_nisu_param_config`, `perimeter='conversation'`).
+- Si une région est en dessous du quota, on prend les **plus récentes** en priorité et on met `datePublication = aujourd'hui`.
 """
 
 def _pg_connect():
@@ -49,7 +34,6 @@ def _pg_connect():
     )
 
 def get_targets(**kwargs):
-    """targets = {region: quota_int} pour perimeter='conversation'"""
     ti = kwargs["ti"]
     with _pg_connect() as connection, connection.cursor() as cur:
         cur.execute("""
@@ -61,12 +45,10 @@ def get_targets(**kwargs):
     logging.info("🎯 Targets (conversation): %s", targets)
     ti.xcom_push(key="targets", value=targets)
 
-def get_published_tomorrow(**kwargs):
-    """published = {region: count} pour les conversations déjà prévues demain"""
+def get_published_today(**kwargs):
     ti = kwargs["ti"]
-    tomorrow = (datetime.now() + timedelta(days=1)).date()
+    today = datetime.now().date()  # si tu préfères le fuseau DB: fais COUNT avec CURRENT_DATE côté SQL
     with _pg_connect() as connection, connection.cursor() as cur:
-        # Compte avec LEFT JOIN pour avoir toutes les régions cibles, même à 0
         cur.execute("""
             SELECT t.config_one AS region, COALESCE(COUNT(c.*), 0) AS cnt
             FROM profil_nisu_param_config t
@@ -76,16 +58,15 @@ def get_published_tomorrow(**kwargs):
             WHERE t.perimeter = 'conversation'
             GROUP BY t.config_one
             ORDER BY t.config_one
-        """, (tomorrow,))
+        """, (today,))
         published = {r: int(cnt) for (r, cnt) in cur.fetchall()}
-    logging.info("📦 Déjà planifiées pour demain: %s", published)
+    logging.info("📦 Déjà planifiées pour aujourd'hui: %s", published)
     ti.xcom_push(key="published", value=published)
 
 def compute_missing(**kwargs):
-    """missing = {region: to_add}"""
     ti = kwargs["ti"]
     targets = ti.xcom_pull(task_ids="get_targets", key="targets") or {}
-    published = ti.xcom_pull(task_ids="get_published_tomorrow", key="published") or {}
+    published = ti.xcom_pull(task_ids="get_published_today", key="published") or {}
     missing = {}
     for region, target in targets.items():
         cur = published.get(region, 0)
@@ -95,23 +76,23 @@ def compute_missing(**kwargs):
     logging.info("🧮 Manque par région: %s", missing)
     ti.xcom_push(key="missing", value=missing)
 
-def rotate_and_update(**kwargs):
-    """Assigne datePublication=demain aux dernières conversations (roulement)."""
+def rotate_and_update_for_today(**kwargs):
+    """Assigne datePublication=AUJOURD'HUI aux dernières conversations (roulement)."""
     ti = kwargs["ti"]
     missing = ti.xcom_pull(task_ids="compute_missing", key="missing") or {}
     if not missing:
         logging.info("✅ Aucun complément nécessaire.")
         return
 
-    tomorrow = (datetime.now() + timedelta(days=1)).date()
+    today = datetime.now().date()
 
     with _pg_connect() as connection, connection.cursor() as cur:
         total = 0
         for region, to_add in missing.items():
             logging.info("↪️ Région %s : besoin de %s", region, to_add)
 
-            # Candidats = même région, pas déjà demain
-            # Priorité aux plus RÉCENTES (roulement) : datePublication DESC (NULLS FIRST), id DESC
+            # Candidats = même région, pas déjà aujourd'hui
+            # Priorité aux plus RÉCENTES : datePublication DESC (NULLS FIRST), id DESC
             cur.execute("""
                 SELECT id
                 FROM profil_conversationactivity
@@ -119,28 +100,27 @@ def rotate_and_update(**kwargs):
                   AND ("datePublication" IS DISTINCT FROM %s)
                 ORDER BY "datePublication" DESC NULLS FIRST, id DESC
                 LIMIT %s
-            """, (region, tomorrow, to_add))
+            """, (region, today, to_add))
             ids = [row[0] for row in cur.fetchall()]
             if not ids:
                 logging.info("… Pas de candidats pour %s", region)
                 continue
 
-            # Mise à jour en lot
             cur.execute("""
                 UPDATE profil_conversationactivity
                 SET "datePublication" = %s
                 WHERE id = ANY(%s)
-            """, (tomorrow, ids))
+            """, (today, ids))
             total += cur.rowcount
-            logging.info("✅ %s conversations replanifiées pour demain (%s)", cur.rowcount, region)
+            logging.info("✅ %s conversations fixées à aujourd'hui (%s)", cur.rowcount, region)
 
         connection.commit()
-        logging.info("🎉 Total replanifiées: %s", total)
+        logging.info("🎉 Total mises à aujourd'hui: %s", total)
 
 with DAG(
-    dag_id="update_conversations_for_next_day",
+    dag_id="update_conversations_for_today",
     start_date=days_ago(1),
-    schedule_interval="0 1 * * *",  # tous les jours à 01:00
+    schedule_interval="0 1 * * *",  # tous les jours à 01:00 (à adapter si besoin)
     catchup=False,
     default_args=default_args,
     tags=["conversation", "region", "rotation", "quota"],
@@ -154,8 +134,8 @@ with DAG(
     )
 
     t2 = PythonOperator(
-        task_id="get_published_tomorrow",
-        python_callable=get_published_tomorrow,
+        task_id="get_published_today",
+        python_callable=get_published_today,
         provide_context=True,
     )
 
@@ -166,8 +146,8 @@ with DAG(
     )
 
     t4 = PythonOperator(
-        task_id="rotate_and_update",
-        python_callable=rotate_and_update,
+        task_id="rotate_and_update_for_today",
+        python_callable=rotate_and_update_for_today,
         provide_context=True,
     )
 
