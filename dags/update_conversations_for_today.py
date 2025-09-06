@@ -21,7 +21,7 @@ PARIS_TZ = ZoneInfo("Europe/Paris")
 # Table de paramétrage:
 #   profil_nisu_param_config(perimeter, config_one=region, config_two=target/nb)
 # -> filtre par perimeter ci-dessous (adapte si ton libellé diffère)
-PARAM_PERIMETER = "conversation_daily_target"
+PARAM_PERIMETER = "conversation"
 
 # Expo Push
 EXPO_API = "https://exp.host/--/api/v2/push/send"
@@ -106,11 +106,9 @@ def get_targets(**kwargs):
     with _pg_connect() as connection, connection.cursor() as cur:
         cur.execute(
             """
-            SELECT config_one AS region, CAST(NULLIF(config_two, '') AS INTEGER) AS target
-            FROM profil_nisu_param_config
-            WHERE perimeter = %s
-              AND config_one IS NOT NULL
-              AND config_one <> ''
+                SELECT config_one AS region, COALESCE(CAST(float_param AS INTEGER), 0) AS target
+                FROM profil_nisu_param_config
+                WHERE perimeter = %s
             """,
             (PARAM_PERIMETER,),
         )
