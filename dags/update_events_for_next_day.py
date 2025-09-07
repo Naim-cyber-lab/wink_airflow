@@ -195,7 +195,14 @@ def update_events(**kwargs):
                     WHERE "dateEvent" IS NULL
                       AND region = %s
                       AND (active = 0 OR active IS NULL)
-                    ORDER BY "datePublication" IS NOT NULL, "datePublication" ASC
+                    ORDER BY
+                      CASE
+                        WHEN "datePublication" IS NULL THEN 0
+                        WHEN "datePublication" <= CURRENT_DATE THEN 1
+                        ELSE 2
+                      END,
+                      "datePublication" ASC,
+                      id ASC
                     LIMIT %s;
             """, (region, to_add))
 
