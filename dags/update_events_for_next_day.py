@@ -1,3 +1,5 @@
+from zoneinfo import ZoneInfo
+
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.hooks.base import BaseHook
@@ -218,6 +220,7 @@ def update_events(**kwargs):
     except Exception as e:
         logging.error(f"❌ Erreur dans update_events : {e}")
         raise
+PARIS_TZ = ZoneInfo("Europe/Paris")
 
 with DAG(
     dag_id="update_events_for_next_day_xcom",
@@ -228,6 +231,7 @@ with DAG(
     tags=["event", "region", "xcom", "log"]
 ) as dag:
     dag.doc_md = DAG_DOC
+    dag.timezone = PARIS_TZ
 
     t1 = PythonOperator(
         task_id="get_target_per_region",
