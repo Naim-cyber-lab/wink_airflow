@@ -1,3 +1,5 @@
+from zoneinfo import ZoneInfo
+
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.hooks.base import BaseHook
@@ -75,6 +77,7 @@ def clean_orphan_videos():
             cursor.close()
         if 'connection' in locals():
             connection.close()
+PARIS_TZ = ZoneInfo("Europe/Paris")
 
 with DAG(
     dag_id="clean_orphan_videos_dag",
@@ -83,9 +86,9 @@ with DAG(
     start_date=datetime(2024, 1, 1),
     catchup=False,
     tags=["cleanup", "videos", "maintenance"],
-    default_args=default_args,
-    timezone="Europe/Paris",
+    default_args=default_args
 ) as dag:
+    dag.timezone = PARIS_TZ
 
     clean_task = PythonOperator(
         task_id="delete_orphan_videos",

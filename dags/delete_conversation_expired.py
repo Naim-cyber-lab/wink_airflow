@@ -1,3 +1,5 @@
+from zoneinfo import ZoneInfo
+
 from airflow import DAG
 from airflow.providers.postgres.operators.postgres import PostgresOperator
 from datetime import datetime
@@ -86,14 +88,17 @@ WHERE id IN (SELECT id FROM expired_conversations);
 
 """
 
+PARIS_TZ = ZoneInfo("Europe/Paris")
+
+
 with DAG(
     dag_id="delete_expired_conversations",
     schedule_interval="@daily",
     default_args=default_args,
     catchup=False,
-    tags=["cleanup", "conversations"],
-    timezone="Europe/Paris",
+    tags=["cleanup", "conversations"]
 ) as dag:
+    dag.timezone = PARIS_TZ
 
     delete_expired_conversations_task = PostgresOperator(
         task_id="delete_expired_conversations_task",

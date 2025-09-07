@@ -1,3 +1,5 @@
+from zoneinfo import ZoneInfo
+
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from datetime import datetime
@@ -11,13 +13,16 @@ def call_relance_conversation(**kwargs):
     except Exception as e:
         print(f"❌ Erreur appel /relance_conversation/ : {e}")
 
+
+PARIS_TZ = ZoneInfo("Europe/Paris")
+
 with DAG(
     dag_id="llm_relance_conversation",
     start_date=datetime(2024, 1, 1),
     schedule_interval="0 3 * * *",  # chaque jour à 3h
-    catchup=False,
-    timezone="Europe/Paris",
+    catchup=False
 ) as dag:
+    dag.timezone = PARIS_TZ
 
     relancer = PythonOperator(
         task_id="relance_conversation",

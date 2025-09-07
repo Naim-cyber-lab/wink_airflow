@@ -1,4 +1,5 @@
 # handle_video_by_week.py
+from zoneinfo import ZoneInfo
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
@@ -69,6 +70,7 @@ def nullify_old_publications(**kwargs):
     except Exception as e:
         logging.error(f"❌ Erreur dans nullify_old_publications : {e}")
         raise
+PARIS_TZ = ZoneInfo("Europe/Paris")
 
 
 with DAG(
@@ -78,9 +80,10 @@ with DAG(
     start_date=days_ago(1),
     catchup=False,
     default_args=default_args,
-    tags=['cleanup', 'event', 'profil_event'],
-    timezone="Europe/Paris",
+    tags=['cleanup', 'event', 'profil_event']
 ) as dag:
+    dag.timezone = PARIS_TZ
+
     dag.doc_md = DAG_DOC
 
     nullify_task = PythonOperator(

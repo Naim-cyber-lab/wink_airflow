@@ -8,8 +8,11 @@ import subprocess
 import yt_dlp
 import logging
 import psycopg2
+from zoneinfo import ZoneInfo
 
 import requests
+
+PARIS_TZ = ZoneInfo("Europe/Paris")
 
 def get_lat_lon(address: str, postal_code: str, region: str, country: str = "France"):
     query = f"{address}, {postal_code}, {region}, {country}"
@@ -254,9 +257,9 @@ with DAG(
     start_date=datetime(2024, 1, 1),
     timezone="Europe/Paris",
     schedule_interval="0 22 * * *",  # Tous les jours à 22h
-    catchup=False,
-    tags=["tiktok", "video", "download"],
+    catchup=False
 ) as dag:
+    dag.timezone = PARIS_TZ
 
     download_task = PythonOperator(
         task_id="process_scrapping_videos",

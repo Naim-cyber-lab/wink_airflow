@@ -12,7 +12,7 @@ from airflow.hooks.base import BaseHook
 from airflow.models import Variable
 from airflow.operators.python import PythonOperator
 from airflow.utils.dates import days_ago
-
+from airflow.utils import timezone
 # ---------- CONFIG ----------
 
 DB_CONN_ID = "my_postgres"  # Airflow Connection -> Postgres
@@ -262,9 +262,9 @@ with DAG(
     start_date=days_ago(1),
     catchup=False,
     max_active_runs=1,
-    tags=["conversations", "push", "expo"],
-    timezone="Europe/Paris",
+    tags=["conversations", "push", "expo"]
 ) as dag:
+    dag.timezone = PARIS_TZ
 
     t1 = PythonOperator(
         task_id="get_targets",

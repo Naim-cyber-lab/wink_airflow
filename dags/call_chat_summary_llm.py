@@ -1,3 +1,5 @@
+from zoneinfo import ZoneInfo
+
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from datetime import datetime
@@ -10,14 +12,15 @@ def call_chat_summary(**kwargs):
         print("✅ Résumé généré :", response.text)
     except Exception as e:
         print(f"❌ Erreur appel /chat-summary/ : {e}")
+PARIS_TZ = ZoneInfo("Europe/Paris")
 
 with DAG(
     dag_id="llm_generate_summary",
     start_date=datetime(2024, 1, 1),
     schedule_interval="0 2 * * *",  # chaque jour à 2h
-    catchup=False,
-    timezone="Europe/Paris",
+    catchup=False
 ) as dag:
+    dag.timezone = PARIS_TZ
 
     generate = PythonOperator(
         task_id="generate_chat_summary",
