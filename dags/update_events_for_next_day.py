@@ -194,7 +194,7 @@ def update_events(**kwargs):
                     FROM profil_event
                     WHERE "dateEvent" IS NULL
                       AND region = %s
-                      AND (active = 0 OR active IS NULL)
+                      -- AND (active = 0 OR active IS NULL)
                     ORDER BY
                       CASE
                         WHEN "datePublication" IS NULL THEN 0
