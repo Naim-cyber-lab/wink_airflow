@@ -15,7 +15,8 @@ with DAG(
     dag_id="llm_generate_summary",
     start_date=datetime(2024, 1, 1),
     schedule_interval="0 2 * * *",  # chaque jour à 2h
-    catchup=False
+    catchup=False,
+    timezone="Europe/Paris",
 ) as dag:
 
     generate = PythonOperator(

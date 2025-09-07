@@ -252,6 +252,7 @@ def process_validated_scrapping_videos(conn_id='my_postgres'):
 with DAG(
     dag_id="download_tiktok_video_dag",
     start_date=datetime(2024, 1, 1),
+    timezone="Europe/Paris",
     schedule_interval="0 22 * * *",  # Tous les jours à 22h
     catchup=False,
     tags=["tiktok", "video", "download"],

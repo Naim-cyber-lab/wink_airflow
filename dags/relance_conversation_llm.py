@@ -15,7 +15,8 @@ with DAG(
     dag_id="llm_relance_conversation",
     start_date=datetime(2024, 1, 1),
     schedule_interval="0 3 * * *",  # chaque jour à 3h
-    catchup=False
+    catchup=False,
+    timezone="Europe/Paris",
 ) as dag:
 
     relancer = PythonOperator(

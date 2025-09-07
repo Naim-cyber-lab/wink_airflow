@@ -226,6 +226,7 @@ with DAG(
     catchup=False,
     default_args=default_args,
     tags=["event", "region", "xcom", "log"],
+    timezone="Europe/Paris",
 ) as dag:
     dag.doc_md = DAG_DOC
 

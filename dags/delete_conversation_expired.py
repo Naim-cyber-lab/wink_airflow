@@ -92,6 +92,7 @@ with DAG(
     default_args=default_args,
     catchup=False,
     tags=["cleanup", "conversations"],
+    timezone="Europe/Paris",
 ) as dag:
 
     delete_expired_conversations_task = PostgresOperator(

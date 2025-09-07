@@ -84,6 +84,7 @@ with DAG(
     catchup=False,
     tags=["cleanup", "videos", "maintenance"],
     default_args=default_args,
+    timezone="Europe/Paris",
 ) as dag:
 
     clean_task = PythonOperator(

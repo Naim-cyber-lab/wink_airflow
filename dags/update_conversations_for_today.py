@@ -263,6 +263,7 @@ with DAG(
     catchup=False,
     max_active_runs=1,
     tags=["conversations", "push", "expo"],
+    timezone="Europe/Paris",
 ) as dag:
 
     t1 = PythonOperator(

@@ -79,6 +79,7 @@ with DAG(
     catchup=False,
     default_args=default_args,
     tags=['cleanup', 'event', 'profil_event'],
+    timezone="Europe/Paris",
 ) as dag:
     dag.doc_md = DAG_DOC
 
