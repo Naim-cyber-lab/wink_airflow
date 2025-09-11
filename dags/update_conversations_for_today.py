@@ -258,7 +258,7 @@ with DAG(
     dag_id="update_conversations_for_today",
     default_args=default_args,
     description="Fixe les conversations du jour par région et notifie les utilisateurs (Expo).",
-    schedule_interval="0 7 * * *",  # tous les jours à 07:00 (serveur). Adapte si besoin.
+    schedule_interval="0 0 * * *",  # tous les jours à 00:00 (Europe/Paris)
     start_date=days_ago(1),
     catchup=False,
     max_active_runs=1,
