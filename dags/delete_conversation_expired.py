@@ -121,6 +121,12 @@ nulled_stories AS (
     WHERE conversation_id IN (SELECT id FROM to_delete)
     RETURNING 1
 ),
+deleted_seen_flags AS (
+    DELETE FROM seen_winker_activity
+    WHERE "conversationActivity_id" IN (SELECT id FROM to_delete)
+    RETURNING 1
+),
+
 
 /* Supprimer les conversations à supprimer */
 deleted_conversations AS (
@@ -142,6 +148,7 @@ counts AS (
         (SELECT COUNT(*)::int FROM deleted_participants)         AS participants_deleted,
         (SELECT COUNT(*)::int FROM deleted_preferences)          AS preferences_deleted,
         (SELECT COUNT(*)::int FROM deleted_notifications)        AS notifications_deleted,
+        (SELECT COUNT(*)::int FROM deleted_seen_flags)           AS seen_flags_deleted,
         (SELECT COUNT(*)::int FROM deleted_conversations)        AS conversations_deleted
 )
 SELECT * FROM counts;
@@ -174,6 +181,7 @@ def log_cleanup_counts(ti, **_):
         "participants_deleted",
         "preferences_deleted",
         "notifications_deleted",
+        "seen_flags_deleted",
         "conversations_deleted",
     ]
     # Sécurise le mapping en cas de driver différent
