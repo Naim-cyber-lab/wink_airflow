@@ -126,7 +126,7 @@ counts AS (
         (SELECT COUNT(*)::int FROM deleted_votes)                AS votes_deleted,
         (SELECT COUNT(*)::int FROM deleted_participants)         AS participants_deleted,
         (SELECT COUNT(*)::int FROM deleted_preferences)          AS preferences_deleted,
-        (SELECT COUNT(*)::int FROM deleted_notifications)        AS notifications_deleted,
+        (SELECT COUNT(*)::int FROM deleted_notifications)        AS notifications_deleted
         -- (SELECT COUNT(*)::int FROM deleted_conversations)        AS conversations_deleted
 )
 SELECT * FROM counts;
