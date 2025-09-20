@@ -18,9 +18,9 @@ WITH expired AS (
         id,
         COALESCE(nb_conversations_scheduled, 0)  AS n_sched,
         COALESCE(interval_days_scheduled, 0)     AS d_gap,
-        COALESCE(datePublication, CURRENT_DATE)  AS dp
+        COALESCE("datePublication", CURRENT_DATE)  AS dp
     FROM profil_conversationactivity
-    WHERE date < NOW()
+    WHERE "date" < NOW()
 ),
 
 /* ---------- Cas A : à replanifier ---------- */
@@ -30,7 +30,7 @@ to_reschedule AS (
 do_reschedule AS (
     UPDATE profil_conversationactivity c
     SET
-        datePublication = (COALESCE(c.datePublication, CURRENT_DATE)::date
+        "datePublication" = (COALESCE(c."datePublication", CURRENT_DATE)::date
                            + (INTERVAL '1 day' * COALESCE(c.interval_days_scheduled, 0)))::date,
         nb_conversations_scheduled = GREATEST(COALESCE(c.nb_conversations_scheduled, 0) - 1, 0)
     FROM to_reschedule r
