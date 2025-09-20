@@ -78,11 +78,26 @@ deleted_polls AS (
     WHERE id IN (SELECT id FROM expired_polls)
     RETURNING 1
 ),
+nulled_last_message AS (
+    UPDATE profil_conversationactivity ca
+    SET "lastMessage_id" = NULL
+    WHERE "lastMessage_id" IN (SELECT id FROM expired_messages)
+    RETURNING 1
+),
 deleted_messages AS (
     DELETE FROM profil_conversationactivitymessages
     WHERE id IN (SELECT id FROM expired_messages)
     RETURNING 1
 ),
+/* Si tu as aussi un firstMessage_id (ou pinnedMessage_id, etc.), décommente : */
+/*
+nulled_first_message AS (
+    UPDATE profil_conversationactivity ca
+    SET "firstMessage_id" = NULL
+    WHERE "firstMessage_id" IN (SELECT id FROM expired_messages)
+    RETURNING 1
+),
+*/
 deleted_participants AS (
     DELETE FROM profil_participantconversationactivity
     WHERE "conversationActivity_id" IN (SELECT id FROM to_delete)
