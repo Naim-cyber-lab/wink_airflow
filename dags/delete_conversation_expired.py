@@ -123,11 +123,11 @@ nulled_stories AS (
 ),
 
 /* Supprimer les conversations à supprimer */
--- deleted_conversations AS (
---    DELETE FROM profil_conversationactivity
---    WHERE id IN (SELECT id FROM to_delete)
---    RETURNING 1
--- ),
+deleted_conversations AS (
+   DELETE FROM profil_conversationactivity
+   WHERE id IN (SELECT id FROM to_delete)
+   RETURNING 1
+),
 
 /* Compteurs pour les logs */
 counts AS (
