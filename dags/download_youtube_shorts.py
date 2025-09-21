@@ -13,7 +13,7 @@ PARIS_TZ = ZoneInfo("Europe/Paris")
 OUTPUT_DIR = os.environ.get("YOUTUBE_OUTPUT_DIR", "/opt/airflow/videos")
 
 # URL du Short (forme canonique pour éviter certains blocages)
-YOUTUBE_SHORT_FR = "https://www.youtube.com/shorts/PvHAdF7Lzi4"
+YOUTUBE_SHORT_FR = "https://www.youtube.com/shorts/s2eDWQCBieE"
 
 
 
@@ -133,7 +133,7 @@ def download_youtube_short(url: str, filename: str):
 
 
 def task_download_fr():
-    return download_youtube_short(YOUTUBE_SHORT_FR, "video_explicative_fr.mp4")
+    return download_youtube_short(YOUTUBE_SHORT_FR, "video_explicative_en.mp4")
 
 
 default_args = {
@@ -156,6 +156,6 @@ with DAG(
     dag.timezone = PARIS_TZ
 
     download_fr = PythonOperator(
-        task_id="download_video_explicative_fr",
+        task_id="download_video_explicative_en",
         python_callable=task_download_fr,
     )
