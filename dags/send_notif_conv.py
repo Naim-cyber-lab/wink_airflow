@@ -101,7 +101,7 @@ def get_idf_tokens(**kwargs):
             """
             SELECT "expoPushToken"
             FROM profil_winker
-            WHERE LOWER(COALESCE(region, '')) IN (
+            WHERE region IN (
                 'ile-de-france', 'ile de france', 'ile_de_france', 'idf', 'Île-de-France'
             )
               AND "expoPushToken" IS NOT NULL
