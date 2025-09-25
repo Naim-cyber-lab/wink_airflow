@@ -18,9 +18,9 @@ EXPO_PUSH_URL = os.environ.get(
 # Si tu utilises un token d'accès Expo (facultatif mais recommandé côté prod)
 EXPO_ACCESS_TOKEN = os.environ.get("EXPO_ACCESS_TOKEN")  # "Bearer <token>"
 
-DEFAULT_PUSH_TOKEN = "ExponentPushToken[Xpc9_0CnSvzouox6mvLuZN]"
-DEFAULT_USER_ID = 189
-DEFAULT_TITLE = "Des utilisateurs veulent rejoindre votre conversation"
+DEFAULT_PUSH_TOKEN = "ExponentPushToken[8FAym7DGGjpoarb1cdthWo]"
+DEFAULT_USER_ID = 261
+DEFAULT_TITLE = "5 utilisateurs veulent rejoindre votre conversation"
 DEFAULT_BODY = "Vous avez 5 nouvelles demandes pour rejoindre votre conversation !"
 DEFAULT_DATA = os.environ.get("DEFAULT_PUSH_DATA_JSON", '{}')  # JSON string
 
