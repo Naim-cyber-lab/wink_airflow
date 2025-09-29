@@ -18,7 +18,7 @@ PARIS_TZ = ZoneInfo("Europe/Paris")
 DB_CONN_ID = "my_postgres"          # Airflow Connection (Postgres)
 SENDER_ID = 116                     # l'expéditeur
 
-# Texte du message (modifiable via Variables Airflow si tu préfères)
+# Texte du message (modifiable via Variables Airflow)
 MESSAGE_TEXT = Variable.get(
     "BROADCAST_MESSAGE_116",
     default_var=(
@@ -46,9 +46,6 @@ default_args = {
 # ========= HELPERS =========
 
 def _pg_connect():
-    """
-    Connexion Postgres via l'Airflow Connection.
-    """
     conn = BaseHook.get_connection(DB_CONN_ID)
     return psycopg2.connect(
         host=conn.host,
@@ -59,9 +56,6 @@ def _pg_connect():
     )
 
 def _send_expo(tokens, title, body, data=None):
-    """
-    Envoie des push Expo par paquets de 100 (filtre tokens valides).
-    """
     messages = [
         {
             "to": t,
@@ -104,9 +98,6 @@ def _send_expo(tokens, title, body, data=None):
 # ========= TASKS =========
 
 def get_targets(**kwargs):
-    """
-    Liste des winker.id à qui SENDER_ID n'a jamais écrit (symétrie respectée).
-    """
     ti = kwargs["ti"]
     with _pg_connect() as connection, connection.cursor() as cur:
         cur.execute(
@@ -134,8 +125,8 @@ def get_targets(**kwargs):
 def send_messages_and_collect_tokens(**kwargs):
     """
     Pour chaque cible :
-      1) Crée/assure la conversation 116 <-> target (EN RENSEIGNANT created/modified/lastMessageTime)
-      2) Insère le message (116 -> target) avec created/modified
+      1) Crée/assure la conversation 116 <-> target (renseigne created/modified/lastMessageTime)
+      2) Insère le message (116 -> target) en renseignant aussi is_removed / isSaved
       3) Met à jour lastMessage/lastMessageTime/compteurs côté destinataire
       4) Récupère le token Expo du destinataire
     """
@@ -170,8 +161,7 @@ def send_messages_and_collect_tokens(**kwargs):
                     if row:
                         chat_id = row[0]
                     else:
-                        # 2) CREER la conversation AVANT d'envoyer un message
-                        #    TimeStampedModel => created/modified NOT NULL -> les renseigner ici.
+                        # 2) Créer la conversation (TimeStampedModel => created/modified obligatoires)
                         cur.execute(
                             """
                             INSERT INTO profil_chatwinker
@@ -194,24 +184,24 @@ def send_messages_and_collect_tokens(**kwargs):
                         )
                         chat_id = cur.fetchone()[0]
 
-                    # 3) Insérer le message (116 -> target) avec created/modified
+                    # 3) Insérer le message (⚠️ SoftDeletableModel => is_removed NOT NULL)
                     cur.execute(
                         """
                         INSERT INTO profil_chatwinkermessagesclass
-                            ("chatWinker_id", "winker_id", "winker2_id",
-                             message, "isLiked", seen, is_read,
-                             created, modified)
+                            (created, modified, is_removed,
+                             "chatWinker_id", "winker_id", "winker2_id",
+                             message, "isLiked", seen, is_read, "isSaved")
                         VALUES
-                            (%s, %s, %s,
-                             %s, FALSE, FALSE, FALSE,
-                             NOW(), NOW())
+                            (NOW(), NOW(), FALSE,
+                             %s, %s, %s,
+                             %s, FALSE, FALSE, FALSE, FALSE)
                         RETURNING id
                         """,
                         (chat_id, SENDER_ID, target_id, MESSAGE_TEXT),
                     )
                     msg_id = cur.fetchone()[0]
 
-                    # 4) Mettre à jour la conversation (lastMessage/Time + unseen destinataire + modified)
+                    # 4) Maj conversation (lastMessage/Time + unseen côté destinataire + modified)
                     cur.execute(
                         """
                         UPDATE profil_chatwinker
@@ -252,9 +242,6 @@ def send_messages_and_collect_tokens(**kwargs):
     ti.xcom_push(key="expo_tokens", value=expo_tokens)
 
 def push_notifications(**kwargs):
-    """
-    Envoie la notification Expo à tous les destinataires traités.
-    """
     ti = kwargs["ti"]
     tokens = ti.xcom_pull(task_ids="send_messages_and_collect_tokens", key="expo_tokens") or []
     if not tokens:
@@ -271,7 +258,7 @@ def push_notifications(**kwargs):
 # ========= DAG =========
 
 with DAG(
-    dag_id="broadcast_from_116",   # garde le même id si tu veux écraser l'existant
+    dag_id="broadcast_from_116",
     description="Crée la conversation si besoin, envoie un message depuis 116 aux cibles, puis push Expo.",
     default_args=default_args,
     schedule_interval=None,        # déclenchement manuel
