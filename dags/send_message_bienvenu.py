@@ -1,4 +1,4 @@
-# dags/broadcast_from_116.py
+# dags/send_message_bienvenu.py
 import os
 import logging
 from datetime import timedelta
@@ -15,26 +15,27 @@ from airflow.utils.dates import days_ago
 
 # ========= CONFIG =========
 PARIS_TZ = ZoneInfo("Europe/Paris")
-DB_CONN_ID = "my_postgres"         # Airflow Connection (Postgres)
-SENDER_ID = 116                    # <- l'expéditeur demandé
-# Contenu du message (configurable via Variables Airflow)
-MESSAGE_TEXT = """
-    👋 Bienvenue sur Nisu !
-    Ici, la bienveillance et le respect sont essentiels 💜
-    
-    ✨ Parrainage : si tu parraines un nouvel utilisateur (en lui faisant envoyer ton pseudo à Nisu Official lors de son inscription), ton compte est boosté 1 mois 🚀 :
-    
-    Conversations plus visibles
-    
-    5 conversations au lieu de 3
-    
-    Accès complet aux messages
-    
-    Merci d’être parmi nous 🙏 Amuse-toi bien sur Nisu ! 🎉
-        """
+DB_CONN_ID = "my_postgres"          # Airflow Connection (Postgres)
+SENDER_ID = 116                     # l'expéditeur
+
+# Texte du message (modifiable via Variables Airflow si tu préfères)
+MESSAGE_TEXT = Variable.get(
+    "BROADCAST_MESSAGE_116",
+    default_var=(
+        "👋 Bienvenue sur Nisu !\n"
+        "Ici, la bienveillance et le respect sont essentiels 💜\n\n"
+        "✨ Parrainage : si tu parraines un nouvel utilisateur (en lui faisant envoyer "
+        "ton pseudo à Nisu Official lors de son inscription), ton compte est boosté 1 mois 🚀 :\n"
+        "• Conversations plus visibles\n"
+        "• 5 conversations au lieu de 3\n"
+        "• Accès complet aux messages\n\n"
+        "Merci d’être parmi nous 🙏 Amuse-toi bien sur Nisu ! 🎉"
+    )
+)
 
 # Expo Push
 EXPO_API = "https://exp.host/--/api/v2/push/send"
+EXPO_ACCESS_TOKEN = Variable.get("EXPO_ACCESS_TOKEN", default_var=os.getenv("EXPO_ACCESS_TOKEN", ""))
 
 default_args = {
     "owner": "airflow",
@@ -60,7 +61,6 @@ def _pg_connect():
 def _send_expo(tokens, title, body, data=None):
     """
     Envoie des push Expo par paquets de 100 (filtre tokens valides).
-    Inspiré de ton DAG de notif IDF.  :contentReference[oaicite:2]{index=2}
     """
     messages = [
         {
@@ -78,10 +78,9 @@ def _send_expo(tokens, title, body, data=None):
         logging.info("🔕 Aucun token Expo valide.")
         return 0
 
-    headers = {
-        "accept": "application/json",
-        "content-type": "application/json",
-    }
+    headers = {"accept": "application/json", "content-type": "application/json"}
+    if EXPO_ACCESS_TOKEN:
+        headers["Authorization"] = f"Bearer {EXPO_ACCESS_TOKEN}"
 
     sent = 0
     for i in range(0, len(messages), 100):
@@ -106,8 +105,7 @@ def _send_expo(tokens, title, body, data=None):
 
 def get_targets(**kwargs):
     """
-    Récupère la liste des winker.id à qui SENDER_ID n'a jamais écrit (symétrie respectée).
-    C’est exactement ta logique, encapsulée ici.
+    Liste des winker.id à qui SENDER_ID n'a jamais écrit (symétrie respectée).
     """
     ti = kwargs["ti"]
     with _pg_connect() as connection, connection.cursor() as cur:
@@ -136,10 +134,10 @@ def get_targets(**kwargs):
 def send_messages_and_collect_tokens(**kwargs):
     """
     Pour chaque cible :
-      - Assure/Crée la conversation symétrique avec 116 (si absente)
-      - Insère le message (winker=116 -> winker2=target)
-      - Met à jour lastMessage / lastMessageTime / nbUnseen côté destinataire
-      - Récupère le token Expo du destinataire pour notification
+      1) Crée/assure la conversation 116 <-> target (EN RENSEIGNANT created/modified/lastMessageTime)
+      2) Insère le message (116 -> target) avec created/modified
+      3) Met à jour lastMessage/lastMessageTime/compteurs côté destinataire
+      4) Récupère le token Expo du destinataire
     """
     ti = kwargs["ti"]
     targets = ti.xcom_pull(task_ids="get_targets", key="targets") or []
@@ -156,7 +154,7 @@ def send_messages_and_collect_tokens(**kwargs):
         try:
             with connection.cursor() as cur:
                 for target_id in targets:
-                    # 1) Trouver conversation existante
+                    # 1) Conversation existante ?
                     cur.execute(
                         """
                         SELECT id
@@ -168,40 +166,58 @@ def send_messages_and_collect_tokens(**kwargs):
                         (SENDER_ID, target_id, target_id, SENDER_ID),
                     )
                     row = cur.fetchone()
+
                     if row:
                         chat_id = row[0]
                     else:
-                        # 2) Créer conversation (on met 116 en winker1 par cohérence)
+                        # 2) CREER la conversation AVANT d'envoyer un message
+                        #    TimeStampedModel => created/modified NOT NULL -> les renseigner ici.
                         cur.execute(
                             """
-                            INSERT INTO profil_chatwinker (winker1_id, winker2_id, "is_chat_group", seen)
-                            VALUES (%s, %s, FALSE, FALSE)
+                            INSERT INTO profil_chatwinker
+                                (created, modified,
+                                 winker1_id, winker2_id,
+                                 is_chat_group, seen,
+                                 "nbUnseenWinker1", "nbUnseenWinker2",
+                                 "lastMessageTime",
+                                 "dataNbNotif", "connectedUser", "allUsers")
+                            VALUES
+                                (NOW(), NOW(),
+                                 %s, %s,
+                                 FALSE, FALSE,
+                                 0, 0,
+                                 NOW(),
+                                 '{}', '[]', '')
                             RETURNING id
                             """,
                             (SENDER_ID, target_id),
                         )
                         chat_id = cur.fetchone()[0]
 
-                    # 3) Insérer le message et récupérer son id
+                    # 3) Insérer le message (116 -> target) avec created/modified
                     cur.execute(
                         """
                         INSERT INTO profil_chatwinkermessagesclass
-                            ( "chatWinker_id", "winker_id", "winker2_id",
-                              message, "isLiked", seen, is_read, created, modified )
-                        VALUES ( %s, %s, %s,
-                                 %s, FALSE, FALSE, FALSE, NOW(), NOW() )
+                            ("chatWinker_id", "winker_id", "winker2_id",
+                             message, "isLiked", seen, is_read,
+                             created, modified)
+                        VALUES
+                            (%s, %s, %s,
+                             %s, FALSE, FALSE, FALSE,
+                             NOW(), NOW())
                         RETURNING id
                         """,
                         (chat_id, SENDER_ID, target_id, MESSAGE_TEXT),
                     )
                     msg_id = cur.fetchone()[0]
 
-                    # 4) Mettre à jour la conversation : lastMessage, lastMessageTime, nbUnseen côté destinataire
+                    # 4) Mettre à jour la conversation (lastMessage/Time + unseen destinataire + modified)
                     cur.execute(
                         """
                         UPDATE profil_chatwinker
                         SET "lastMessage_id" = %s,
                             "lastMessageTime" = NOW(),
+                            modified = NOW(),
                             "nbUnseenWinker1" = CASE
                                 WHEN winker1_id = %s THEN "nbUnseenWinker1" + 1
                                 ELSE "nbUnseenWinker1"
@@ -215,9 +231,9 @@ def send_messages_and_collect_tokens(**kwargs):
                         (msg_id, target_id, target_id, chat_id),
                     )
 
-                    # 5) Récupérer le token Expo du destinataire
+                    # 5) Token Expo du destinataire
                     cur.execute(
-                        """SELECT "expoPushToken" FROM profil_winker WHERE id = %s""",
+                        'SELECT "expoPushToken" FROM profil_winker WHERE id = %s',
                         (target_id,),
                     )
                     tok = cur.fetchone()
@@ -227,7 +243,7 @@ def send_messages_and_collect_tokens(**kwargs):
                     inserted_count += 1
 
             connection.commit()
-            logging.info("✉️ Messages insérés/assurés pour %s destinataires.", inserted_count)
+            logging.info("✉️ Messages créés/envoyés pour %s destinataires.", inserted_count)
         except Exception as e:
             connection.rollback()
             logging.exception("Rollback suite erreur: %s", e)
@@ -247,10 +263,7 @@ def push_notifications(**kwargs):
 
     title = "Nouveau message 💬"
     body = "Vous avez reçu un message."
-    payload = {
-        "type": "chat_message",
-        "from": SENDER_ID,
-    }
+    payload = {"type": "chat_message", "from": SENDER_ID}
 
     sent = _send_expo(tokens, title, body, data=payload)
     logging.info("📲 Push envoyé à %s utilisateurs.", sent)
@@ -258,10 +271,10 @@ def push_notifications(**kwargs):
 # ========= DAG =========
 
 with DAG(
-    dag_id="broadcast_from_116",
-    description="Diffuse un message depuis le compte 116 à tous les winkers n'ayant pas encore échangé avec lui, puis envoie des notifications Expo.",
+    dag_id="broadcast_from_116",   # garde le même id si tu veux écraser l'existant
+    description="Crée la conversation si besoin, envoie un message depuis 116 aux cibles, puis push Expo.",
     default_args=default_args,
-    schedule_interval=None,     # déclenchement manuel (à ta convenance)
+    schedule_interval=None,        # déclenchement manuel
     start_date=days_ago(1),
     catchup=False,
     max_active_runs=1,
