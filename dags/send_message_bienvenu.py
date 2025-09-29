@@ -18,8 +18,7 @@ PARIS_TZ = ZoneInfo("Europe/Paris")
 DB_CONN_ID = "my_postgres"         # Airflow Connection (Postgres)
 SENDER_ID = 116                    # <- l'expéditeur demandé
 # Contenu du message (configurable via Variables Airflow)
-MESSAGE_TEXT = Variable.get(
-    """
+MESSAGE_TEXT = """
     👋 Bienvenue sur Nisu !
     Ici, la bienveillance et le respect sont essentiels 💜
     
@@ -32,7 +31,7 @@ MESSAGE_TEXT = Variable.get(
     Accès complet aux messages
     
     Merci d’être parmi nous 🙏 Amuse-toi bien sur Nisu ! 🎉
-        """)
+        """
 
 # Expo Push
 EXPO_API = "https://exp.host/--/api/v2/push/send"
