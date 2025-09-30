@@ -29,6 +29,7 @@ MESSAGE_TEXT = Variable.get(
         "• Conversations plus visibles\n"
         "• 5 conversations au lieu de 3\n"
         "• Accès complet aux messages\n\n"
+        "Vous pouvez désormais regarder une vidéo de présentation de l'application si vous vous sentez un peu perdue sur la page de profil dans les settings.\n\n"
         "Merci d’être parmi nous 🙏 Amuse-toi bien sur Nisu ! 🎉"
     )
 )
