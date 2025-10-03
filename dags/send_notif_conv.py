@@ -124,7 +124,7 @@ def push_fixed_message(**kwargs):
         return
 
     title = "Nouvelles conversations 📣"  # peut être ajusté si tu veux le laisser vide
-    body = "14 nouvelles conversations disponible !"  # NE PAS MODIFIER (exigence utilisateur)
+    body = "N'oubliez pas de regardez vos nouvelles conversations de la journée !"  # NE PAS MODIFIER (exigence utilisateur)
     payload = {"type": "conversation_info", "region": "ile-de-france", "fixed_count": 14}
 
     sent = _send_expo(tokens, title, body, data=payload)
