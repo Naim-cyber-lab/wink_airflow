@@ -123,8 +123,8 @@ def push_fixed_message(**kwargs):
         logging.info("🔕 Aucun token à notifier.")
         return
 
-    title = "Nouvelles conversations 📣"  # peut être ajusté si tu veux le laisser vide
-    body = "N'oubliez pas de regardez vos nouvelles conversations de la journée !"  # NE PAS MODIFIER (exigence utilisateur)
+    title = "Soirée ce dimanche ? 📣"  # peut être ajusté si tu veux le laisser vide
+    body = "Une soirée ce dimanche pourrait vous intérésser !"  # NE PAS MODIFIER (exigence utilisateur)
     payload = {"type": "conversation_info", "region": "ile-de-france", "fixed_count": 14}
 
     sent = _send_expo(tokens, title, body, data=payload)
