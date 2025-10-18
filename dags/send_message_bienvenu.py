@@ -24,11 +24,6 @@ MESSAGE_TEXT = Variable.get(
     default_var=(
         "👋 Bienvenue sur Nisu !\n"
         "Ici, la bienveillance et le respect sont essentiels 💜\n\n"
-        "✨ Parrainage : si tu parraines un nouvel utilisateur (en lui faisant envoyer "
-        "ton pseudo à Nisu Official lors de son inscription), ton compte est boosté 1 mois 🚀 :\n"
-        "• Conversations plus visibles\n"
-        "• 5 conversations au lieu de 3\n"
-        "• Accès complet aux messages\n\n"
         "Nous sommes une nouvelle application qui essaye de se faire une place. Si vous voyez des problèmes ou des sources d'incompréhension, n'hésitez pas à nous le signaler ici.\n\n"
         "Vous pouvez désormais regarder une vidéo de présentation de l'application si vous vous sentez un peu perdue sur la page de profil dans les settings.\n\n"
         "Merci d’être parmi nous 🙏 Amuse-toi bien sur Nisu ! 🎉"
