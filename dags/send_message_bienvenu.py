@@ -22,11 +22,13 @@ SENDER_ID = 116                     # l'expéditeur
 MESSAGE_TEXT = Variable.get(
     "BROADCAST_MESSAGE_116",
     default_var=(
-        "👋 Bienvenue sur Nisu !\n",
-        "Ici, on se retrouve pour partager des sorties, des rires et de belles rencontres 🌟",
-        "Notre mot d’ordre : bienveillance, respect et bonne humeur 💬💛",
-        "Si tu as la moindre question, tu peux nous écrire directement ici.",
-        "On est ravis de t’accueillir dans la communauté à très vite pour ta première sortie ! 🚀✨"
+        """
+        👋 Bienvenue sur Nisu,
+        Ici, on se retrouve pour partager des sorties, des rires et de belles rencontres 🌟,
+        Notre mot d’ordre : bienveillance, respect et bonne humeur 💬💛,
+        Si tu as la moindre question, tu peux nous écrire directement ici.,
+        On est ravis de t’accueillir dans la communauté à très vite pour ta première sortie ! 🚀✨
+        """
     )
 )
 
