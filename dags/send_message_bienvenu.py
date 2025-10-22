@@ -23,10 +23,11 @@ MESSAGE_TEXT = Variable.get(
     "BROADCAST_MESSAGE_116",
     default_var=(
         "👋 Bienvenue sur Nisu !\n"
-        "Ici, la bienveillance et le respect sont essentiels 💜\n\n"
-        "Nous sommes une nouvelle application qui essaye de se faire une place. Si vous voyez des problèmes ou des sources d'incompréhension, n'hésitez pas à nous le signaler ici.\n\n"
-        "Vous pouvez désormais regarder une vidéo de présentation de l'application si vous vous sentez un peu perdue sur la page de profil dans les settings.\n\n"
-        "Merci d’être parmi nous 🙏 Amuse-toi bien sur Nisu ! 🎉"
+
+        "Ici, on se retrouve pour partager des sorties, des rires et de belles rencontres 🌟",
+        "Notre mot d’ordre : bienveillance, respect et bonne humeur 💬💛",
+        "Si tu as la moindre question, tu peux nous écrire directement ici.",
+        "On est ravis de t’accueillir dans la communauté à très vite pour ta première sortie ! 🚀✨"
     )
 )
 
