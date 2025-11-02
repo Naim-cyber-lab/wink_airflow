@@ -145,7 +145,7 @@ def send_reminders_for_offset(days: int, **context):
 
 with DAG(
     dag_id=DAG_ID,
-    schedule="@daily",
+    schedule="0 10 * * *",
     default_args=default_args,
     catchup=False,
     tags=["reminder", "conversations", "email"],
