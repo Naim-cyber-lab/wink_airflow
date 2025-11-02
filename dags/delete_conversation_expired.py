@@ -48,7 +48,19 @@ to_delete AS (
     SELECT id FROM to_reschedule
 ),
 
-/* Enfants liés aux conversations à supprimer */
+/* ----------- MESSAGES CHAT liés aux conversations à supprimer ----------- */
+expired_chat_msgs AS (
+    SELECT id
+    FROM profil_chatwinkermessagesclass
+    WHERE conversation_id IN (SELECT id FROM to_delete)
+),
+deleted_chat_msgs AS (
+    DELETE FROM profil_chatwinkermessagesclass
+    WHERE id IN (SELECT id FROM expired_chat_msgs)
+    RETURNING 1
+),
+
+/* Enfants liés aux conversations à supprimer (messages "activity") */
 expired_messages AS (
     SELECT id FROM profil_conversationactivitymessages
     WHERE "conversationActivity_id" IN (SELECT id FROM to_delete)
@@ -127,7 +139,6 @@ deleted_seen_flags AS (
     RETURNING 1
 ),
 
-
 /* Supprimer les conversations à supprimer */
 deleted_conversations AS (
    DELETE FROM profil_conversationactivity
@@ -149,6 +160,7 @@ counts AS (
         (SELECT COUNT(*)::int FROM deleted_preferences)          AS preferences_deleted,
         (SELECT COUNT(*)::int FROM deleted_notifications)        AS notifications_deleted,
         (SELECT COUNT(*)::int FROM deleted_seen_flags)           AS seen_flags_deleted,
+        (SELECT COUNT(*)::int FROM deleted_chat_msgs)            AS chat_msgs_deleted,
         (SELECT COUNT(*)::int FROM deleted_conversations)        AS conversations_deleted
 )
 SELECT * FROM counts;
@@ -182,6 +194,7 @@ def log_cleanup_counts(ti, **_):
         "preferences_deleted",
         "notifications_deleted",
         "seen_flags_deleted",
+        "chat_msgs_deleted",        # <-- nouveau compteur
         "conversations_deleted",
     ]
     # Sécurise le mapping en cas de driver différent
