@@ -48,14 +48,14 @@ to_delete AS (
     SELECT id FROM to_reschedule
 ),
 
-/* ----------- MESSAGES CHAT liés aux conversations à supprimer ----------- */
+/* ----------- MESSAGES CHAT 1–1 liés aux conversations à supprimer ----------- */
 expired_chat_msgs AS (
     SELECT id
     FROM profil_chatwinkermessagesclass
     WHERE conversation_id IN (SELECT id FROM to_delete)
 ),
 
-/* 🔥 NEW : on nettoie les références lastMessage_id dans profil_chatwinker */
+/* On nettoie les références lastMessage_id dans profil_chatwinker */
 nulled_chatwinker_last_msg AS (
     UPDATE profil_chatwinker cw
     SET "lastMessage_id" = NULL
@@ -69,13 +69,34 @@ deleted_chat_msgs AS (
     RETURNING 1
 ),
 
+/* ----------- MESSAGES CHAT DE GROUPE liés aux conversations à supprimer ----------- */
+expired_group_chat_msgs AS (
+    SELECT id
+    FROM profil_groupchatwinkermessagesclass
+    WHERE conversation_id IN (SELECT id FROM to_delete)
+),
+
+/* On nettoie les références lastMessage_id dans profil_groupchatwinker */
+nulled_groupchatwinker_last_msg AS (
+    UPDATE profil_groupchatwinker gcw
+    SET "lastMessage_id" = NULL
+    WHERE "lastMessage_id" IN (SELECT id FROM expired_group_chat_msgs)
+    RETURNING 1
+),
+
+deleted_group_chat_msgs AS (
+    DELETE FROM profil_groupchatwinkermessagesclass
+    WHERE id IN (SELECT id FROM expired_group_chat_msgs)
+    RETURNING 1
+),
+
 /* Enfants liés aux conversations à supprimer (messages "activity") */
 expired_messages AS (
     SELECT id FROM profil_conversationactivitymessages
     WHERE "conversationActivity_id" IN (SELECT id FROM to_delete)
 ),
 
-/* 🔥 Réactions liées aux messages expirés */
+/* Réactions liées aux messages expirés */
 expired_reactions AS (
     SELECT id
     FROM profil_conversationactivitymessagereaction
@@ -98,7 +119,7 @@ deleted_votes AS (
     RETURNING 1
 ),
 
-/* 🔥 Suppression des réactions AVANT les messages */
+/* Suppression des réactions AVANT les messages */
 deleted_reactions AS (
     DELETE FROM profil_conversationactivitymessagereaction
     WHERE message_id IN (SELECT id FROM expired_messages)
@@ -115,12 +136,15 @@ deleted_polls AS (
     WHERE id IN (SELECT id FROM expired_polls)
     RETURNING 1
 ),
+
+/* Nuller lastMessage_id des conversations "activity" avant suppression des messages */
 nulled_last_message AS (
     UPDATE profil_conversationactivity ca
     SET "lastMessage_id" = NULL
     WHERE "lastMessage_id" IN (SELECT id FROM expired_messages)
     RETURNING 1
 ),
+
 deleted_messages AS (
     DELETE FROM profil_conversationactivitymessages
     WHERE id IN (SELECT id FROM expired_messages)
@@ -150,6 +174,7 @@ nulled_stories AS (
     WHERE conversation_id IN (SELECT id FROM to_delete)
     RETURNING 1
 ),
+
 deleted_seen_flags AS (
     DELETE FROM seen_winker_activity
     WHERE "conversationActivity_id" IN (SELECT id FROM to_delete)
@@ -179,10 +204,12 @@ counts AS (
         (SELECT COUNT(*)::int FROM deleted_notifications)        AS notifications_deleted,
         (SELECT COUNT(*)::int FROM deleted_seen_flags)           AS seen_flags_deleted,
         (SELECT COUNT(*)::int FROM deleted_chat_msgs)            AS chat_msgs_deleted,
+        (SELECT COUNT(*)::int FROM deleted_group_chat_msgs)      AS group_chat_msgs_deleted,
+        (SELECT COUNT(*)::int FROM nulled_chatwinker_last_msg)   AS chatwinker_last_msg_nulled,
+        (SELECT COUNT(*)::int FROM nulled_groupchatwinker_last_msg) AS groupchatwinker_last_msg_nulled,
         (SELECT COUNT(*)::int FROM deleted_conversations)        AS conversations_deleted
 )
 SELECT * FROM counts;
-
 """
 
 PARIS_TZ = ZoneInfo("Europe/Paris")
@@ -215,6 +242,9 @@ def log_cleanup_counts(ti, **_):
         "notifications_deleted",
         "seen_flags_deleted",
         "chat_msgs_deleted",
+        "group_chat_msgs_deleted",
+        "chatwinker_last_msg_nulled",
+        "groupchatwinker_last_msg_nulled",
         "conversations_deleted",
     ]
     # Sécurise le mapping en cas de driver différent
@@ -238,12 +268,12 @@ with DAG(
         task_id="delete_expired_conversations_task",
         postgres_conn_id="my_postgres",
         sql=SQL_DELETE_EXPIRED_CONVERSATIONS,
-        do_xcom_push=True,  # <— indispensable pour récupérer les compteurs
+        do_xcom_push=True,  # indispensable pour récupérer les compteurs
     )
 
-    log_counts_task = PythonOperator(
+    log_cleanup_counts_task = PythonOperator(
         task_id="log_cleanup_counts",
         python_callable=log_cleanup_counts,
     )
 
-    delete_expired_conversations_task >> log_counts_task
+    delete_expired_conversations_task >> log_cleanup_counts_task
