@@ -78,7 +78,7 @@ expired_group_chat_msgs AS (
 
 /* On nettoie les références lastMessage_id dans profil_groupchatwinker */
 nulled_groupchatwinker_last_msg AS (
-    UPDATE profil_groupchatwinker gcw
+    UPDATE profil_chatwinker gcw
     SET "lastMessage_id" = NULL
     WHERE "lastMessage_id" IN (SELECT id FROM expired_group_chat_msgs)
     RETURNING 1
