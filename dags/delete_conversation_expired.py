@@ -54,6 +54,15 @@ expired_chat_msgs AS (
     FROM profil_chatwinkermessagesclass
     WHERE conversation_id IN (SELECT id FROM to_delete)
 ),
+
+/* 🔥 NEW : on nettoie les références lastMessage_id dans profil_chatwinker */
+nulled_chatwinker_last_msg AS (
+    UPDATE profil_chatwinker cw
+    SET "lastMessage_id" = NULL
+    WHERE "lastMessage_id" IN (SELECT id FROM expired_chat_msgs)
+    RETURNING 1
+),
+
 deleted_chat_msgs AS (
     DELETE FROM profil_chatwinkermessagesclass
     WHERE id IN (SELECT id FROM expired_chat_msgs)
@@ -117,15 +126,7 @@ deleted_messages AS (
     WHERE id IN (SELECT id FROM expired_messages)
     RETURNING 1
 ),
-/* Si tu as aussi un firstMessage_id (ou pinnedMessage_id, etc.), décommente : */
-/*
-nulled_first_message AS (
-    UPDATE profil_conversationactivity ca
-    SET "firstMessage_id" = NULL
-    WHERE "firstMessage_id" IN (SELECT id FROM expired_messages)
-    RETURNING 1
-),
-*/
+
 deleted_participants AS (
     DELETE FROM profil_participantconversationactivity
     WHERE "conversationActivity_id" IN (SELECT id FROM to_delete)
@@ -181,6 +182,7 @@ counts AS (
         (SELECT COUNT(*)::int FROM deleted_conversations)        AS conversations_deleted
 )
 SELECT * FROM counts;
+
 """
 
 PARIS_TZ = ZoneInfo("Europe/Paris")
