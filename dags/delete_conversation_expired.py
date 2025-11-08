@@ -65,6 +65,14 @@ expired_messages AS (
     SELECT id FROM profil_conversationactivitymessages
     WHERE "conversationActivity_id" IN (SELECT id FROM to_delete)
 ),
+
+/* 🔥 Réactions liées aux messages expirés */
+expired_reactions AS (
+    SELECT id
+    FROM profil_conversationactivitymessagereaction
+    WHERE message_id IN (SELECT id FROM expired_messages)
+),
+
 expired_polls AS (
     SELECT id FROM profil_pollconversation
     WHERE "conversation_activity_message_id" IN (SELECT id FROM expired_messages)
@@ -80,6 +88,14 @@ deleted_votes AS (
     WHERE poll_option_id IN (SELECT id FROM expired_poll_options)
     RETURNING 1
 ),
+
+/* 🔥 Suppression des réactions AVANT les messages */
+deleted_reactions AS (
+    DELETE FROM profil_conversationactivitymessagereaction
+    WHERE message_id IN (SELECT id FROM expired_messages)
+    RETURNING 1
+),
+
 deleted_poll_options AS (
     DELETE FROM profil_polloptionconversation
     WHERE id IN (SELECT id FROM expired_poll_options)
@@ -156,6 +172,7 @@ counts AS (
         (SELECT COUNT(*)::int FROM deleted_polls)                AS polls_deleted,
         (SELECT COUNT(*)::int FROM deleted_poll_options)         AS poll_options_deleted,
         (SELECT COUNT(*)::int FROM deleted_votes)                AS votes_deleted,
+        (SELECT COUNT(*)::int FROM deleted_reactions)            AS reactions_deleted,
         (SELECT COUNT(*)::int FROM deleted_participants)         AS participants_deleted,
         (SELECT COUNT(*)::int FROM deleted_preferences)          AS preferences_deleted,
         (SELECT COUNT(*)::int FROM deleted_notifications)        AS notifications_deleted,
@@ -190,11 +207,12 @@ def log_cleanup_counts(ti, **_):
         "polls_deleted",
         "poll_options_deleted",
         "votes_deleted",
+        "reactions_deleted",
         "participants_deleted",
         "preferences_deleted",
         "notifications_deleted",
         "seen_flags_deleted",
-        "chat_msgs_deleted",        # <-- nouveau compteur
+        "chat_msgs_deleted",
         "conversations_deleted",
     ]
     # Sécurise le mapping en cas de driver différent
