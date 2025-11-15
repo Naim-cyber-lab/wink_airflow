@@ -147,6 +147,15 @@ nulled_last_message AS (
     RETURNING 1
 ),
 
+/* 🔹 Nuller aussi lastMessageSeen_id dans profil_participantconversationactivity
+      pour éviter la violation de contrainte FK */
+nulled_participant_last_msg_seen AS (
+    UPDATE profil_participantconversationactivity p
+    SET "lastMessageSeen_id" = NULL
+    WHERE "lastMessageSeen_id" IN (SELECT id FROM expired_messages)
+    RETURNING 1
+),
+
 deleted_messages AS (
     DELETE FROM profil_conversationactivitymessages
     WHERE id IN (SELECT id FROM expired_messages)
@@ -166,6 +175,7 @@ deleted_preferences AS (
     WHERE "conversation_id" IN (SELECT id FROM to_delete)
     RETURNING 1
 ),
+
 deleted_notifications AS (
     DELETE FROM profil_notification
     WHERE "conversation_id" IN (SELECT id FROM to_delete)
@@ -213,6 +223,7 @@ counts AS (
         (SELECT COUNT(*)::int FROM deleted_group_chat_msgs)      AS group_chat_msgs_deleted,
         (SELECT COUNT(*)::int FROM nulled_chatwinker_last_msg)   AS chatwinker_last_msg_nulled,
         (SELECT COUNT(*)::int FROM nulled_groupchatwinker_last_msg) AS groupchatwinker_last_msg_nulled,
+        (SELECT COUNT(*)::int FROM nulled_participant_last_msg_seen) AS participant_last_msg_seen_nulled,
         (SELECT COUNT(*)::int FROM updated_conversations)        AS conversations_marked_deleted
 )
 SELECT * FROM counts;
@@ -250,6 +261,7 @@ def log_cleanup_counts(ti, **_):
         "group_chat_msgs_deleted",
         "chatwinker_last_msg_nulled",
         "groupchatwinker_last_msg_nulled",
+        "participant_last_msg_seen_nulled",
         "conversations_marked_deleted",
     ]
     # Sécurise le mapping en cas de driver différent
