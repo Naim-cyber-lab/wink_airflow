@@ -21,6 +21,7 @@ WITH expired AS (
         COALESCE("datePublication", CURRENT_DATE)  AS dp
     FROM profil_conversationactivity
     WHERE "date" < NOW()
+      AND NOT COALESCE(is_deleted, FALSE) -- on ne retrait pas celles déjà marquées supprimées
 ),
 
 /* ---------- Cas A : à replanifier ---------- */
@@ -41,7 +42,8 @@ rescheduled_count AS (
     SELECT COUNT(*)::int AS rescheduled FROM do_reschedule
 ),
 
-/* ---------- Cas B : à supprimer (stories conservées) ---------- */
+/* ---------- Cas B : à "supprimer" (stories conservées)
+   Ici on ne supprime plus la ConversationActivity, on la marque juste comme deleted ---------- */
 to_delete AS (
     SELECT id FROM expired
     EXCEPT
@@ -151,11 +153,14 @@ deleted_messages AS (
     RETURNING 1
 ),
 
+/* ⚠️ ON NE SUPPRIME PLUS LES PARTICIPANTS
 deleted_participants AS (
     DELETE FROM profil_participantconversationactivity
     WHERE "conversationActivity_id" IN (SELECT id FROM to_delete)
     RETURNING 1
 ),
+*/
+
 deleted_preferences AS (
     DELETE FROM profil_preference
     WHERE "conversation_id" IN (SELECT id FROM to_delete)
@@ -181,10 +186,12 @@ deleted_seen_flags AS (
     RETURNING 1
 ),
 
-/* Supprimer les conversations à supprimer */
-deleted_conversations AS (
-   DELETE FROM profil_conversationactivity
+/* Au lieu de supprimer les conversations, on les marque comme supprimées */
+updated_conversations AS (
+   UPDATE profil_conversationactivity
+   SET is_deleted = TRUE
    WHERE id IN (SELECT id FROM to_delete)
+     AND NOT COALESCE(is_deleted, FALSE)
    RETURNING 1
 ),
 
@@ -199,7 +206,6 @@ counts AS (
         (SELECT COUNT(*)::int FROM deleted_poll_options)         AS poll_options_deleted,
         (SELECT COUNT(*)::int FROM deleted_votes)                AS votes_deleted,
         (SELECT COUNT(*)::int FROM deleted_reactions)            AS reactions_deleted,
-        (SELECT COUNT(*)::int FROM deleted_participants)         AS participants_deleted,
         (SELECT COUNT(*)::int FROM deleted_preferences)          AS preferences_deleted,
         (SELECT COUNT(*)::int FROM deleted_notifications)        AS notifications_deleted,
         (SELECT COUNT(*)::int FROM deleted_seen_flags)           AS seen_flags_deleted,
@@ -207,7 +213,7 @@ counts AS (
         (SELECT COUNT(*)::int FROM deleted_group_chat_msgs)      AS group_chat_msgs_deleted,
         (SELECT COUNT(*)::int FROM nulled_chatwinker_last_msg)   AS chatwinker_last_msg_nulled,
         (SELECT COUNT(*)::int FROM nulled_groupchatwinker_last_msg) AS groupchatwinker_last_msg_nulled,
-        (SELECT COUNT(*)::int FROM deleted_conversations)        AS conversations_deleted
+        (SELECT COUNT(*)::int FROM updated_conversations)        AS conversations_marked_deleted
 )
 SELECT * FROM counts;
 """
@@ -237,7 +243,6 @@ def log_cleanup_counts(ti, **_):
         "poll_options_deleted",
         "votes_deleted",
         "reactions_deleted",
-        "participants_deleted",
         "preferences_deleted",
         "notifications_deleted",
         "seen_flags_deleted",
@@ -245,7 +250,7 @@ def log_cleanup_counts(ti, **_):
         "group_chat_msgs_deleted",
         "chatwinker_last_msg_nulled",
         "groupchatwinker_last_msg_nulled",
-        "conversations_deleted",
+        "conversations_marked_deleted",
     ]
     # Sécurise le mapping en cas de driver différent
     payload = {keys[i]: row[i] for i in range(min(len(keys), len(row)))}
