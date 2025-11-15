@@ -156,9 +156,14 @@ nulled_participant_last_msg_seen AS (
     RETURNING 1
 ),
 
+/* 🔹 DELETE des messages après avoir NULLE toutes les FKs qui pointent vers eux.
+      On force la dépendance sur nulled_last_message et nulled_participant_last_msg_seen
+      via des sous-requêtes COUNT(*) (ne change pas la logique, mais impose l'ordre). */
 deleted_messages AS (
     DELETE FROM profil_conversationactivitymessages
     WHERE id IN (SELECT id FROM expired_messages)
+      AND (SELECT COUNT(*) FROM nulled_last_message) >= 0
+      AND (SELECT COUNT(*) FROM nulled_participant_last_msg_seen) >= 0
     RETURNING 1
 ),
 
