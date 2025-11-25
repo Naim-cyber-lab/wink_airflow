@@ -11,6 +11,7 @@ from airflow.hooks.base import BaseHook
 from airflow.models import Variable
 from airflow.operators.python import PythonOperator
 from airflow.utils.dates import days_ago
+from airflow.models.param import Param
 
 # ========= CONFIG =========
 PARIS_TZ = ZoneInfo("Europe/Paris")
@@ -46,7 +47,7 @@ def _pg_connect():
 
 def _send_expo(tokens, title, body, data=None):
     """
-    Envoi de notifications Expo en chunk de 100 (même logique que ton DAG de broadcast).
+    Envoi de notifications Expo en chunk de 100.
     """
     messages = [
         {
@@ -93,17 +94,16 @@ def _send_expo(tokens, title, body, data=None):
 
 def get_winkers_for_group(**kwargs):
     """
-    Récupère tous les winkers dont l'âge est compris entre min_age et max_age
-    (exclus le créateur) et pousse la liste d'IDs via XCom.
+    Récupère tous les winkers dont l'âge (YEAR(now) - birthYear)
+    est compris entre min_age et max_age (exclut le créateur).
     """
     ti = kwargs["ti"]
-    dag_run = kwargs.get("dag_run")
-    conf = dag_run.conf if dag_run else {}
+    params = kwargs["params"]
 
     try:
-        min_age = int(conf.get("min_age"))
-        max_age = int(conf.get("max_age"))
-        creator_id = int(conf.get("creator_id"))
+        min_age = int(params["min_age"])
+        max_age = int(params["max_age"])
+        creator_id = int(params["creator_id"])
     except Exception as e:
         raise ValueError(
             "Les paramètres min_age, max_age et creator_id sont obligatoires "
@@ -114,15 +114,14 @@ def get_winkers_for_group(**kwargs):
         raise ValueError("min_age ne peut pas être supérieur à max_age.")
 
     with _pg_connect() as connection, connection.cursor() as cur:
-        # ⚠️ ADAPTER selon ton schéma réel :
-        # - Si tu as une colonne 'age' (int) dans profil_winker, la requête ci-dessous est OK.
-        # - Si tu as 'date_of_birth', calcule l'âge avec AGE(NOW(), date_of_birth).
+        # Calcul de l’âge à partir de birthYear
         cur.execute(
             """
             SELECT id
             FROM profil_winker
-            WHERE age BETWEEN %s AND %s
-              AND id <> %s
+            WHERE
+                (EXTRACT(YEAR FROM CURRENT_DATE)::int - "birthYear") BETWEEN %s AND %s
+                AND id <> %s
             """,
             (min_age, max_age, creator_id),
         )
@@ -139,23 +138,21 @@ def get_winkers_for_group(**kwargs):
 
 def create_group_conversation(**kwargs):
     """
-    Crée la conversation de groupe dans profil_chatwinker avec :
+    Crée la conversation de groupe dans profil_chatwinker :
       - is_chat_group = TRUE
       - creatorWinkerGroupChat_id = creator_id
       - winker1_id = creator_id, winker2_id = NULL
-      - listIdGroupWinker = liste des ids (créateur + participants) séparés par des virgules.
-    Pousse l'ID de la conversation et la liste finale des participants via XCom.
+      - listIdGroupWinker = ids des participants (créateur inclus) séparés par des virgules.
     """
     ti = kwargs["ti"]
-    dag_run = kwargs.get("dag_run")
-    conf = dag_run.conf if dag_run else {}
+    params = kwargs["params"]
 
     try:
-        creator_id = int(conf.get("creator_id"))
+        creator_id = int(params["creator_id"])
     except Exception as e:
         raise ValueError("Le paramètre creator_id est obligatoire.") from e
 
-    group_title = conf.get("group_title") or "Conversation de groupe"
+    group_title = params.get("group_title") or "Conversation de groupe"
     winker_ids = ti.xcom_pull(task_ids="get_winkers_for_group", key="winker_ids") or []
 
     # Participants finaux = créateur + tous ceux dans la tranche d'âge
@@ -166,7 +163,6 @@ def create_group_conversation(**kwargs):
         connection.autocommit = False
         try:
             with connection.cursor() as cur:
-                # Création de la conversation de groupe
                 cur.execute(
                     """
                     INSERT INTO profil_chatwinker
@@ -197,9 +193,6 @@ def create_group_conversation(**kwargs):
                 )
                 chat_id = cur.fetchone()[0]
 
-                # (Optionnel) Si tu as un modèle WinkersChatGroup, c'est ici que tu pourrais
-                # insérer les lignes de membership (winker_id, chatWinker_id, ...).
-
             connection.commit()
             logging.info(
                 "💬 Conversation de groupe créée (id=%s, titre='%s', nb_participants=%s).",
@@ -207,7 +200,7 @@ def create_group_conversation(**kwargs):
             )
         except Exception as e:
             connection.rollback()
-            logging.exception("Rollback suite erreur dans create_group_conversation: %s", e)
+            logging.exception("Rollback dans create_group_conversation: %s", e)
             raise
 
     ti.xcom_push(key="chat_id", value=chat_id)
@@ -220,10 +213,9 @@ def notify_group_participants(**kwargs):
     et envoie une notification pour indiquer qu'ils ont été ajoutés au groupe.
     """
     ti = kwargs["ti"]
-    dag_run = kwargs.get("dag_run")
-    conf = dag_run.conf if dag_run else {}
+    params = kwargs["params"]
 
-    group_title = conf.get("group_title") or "Conversation de groupe"
+    group_title = params.get("group_title") or "Conversation de groupe"
     chat_id = ti.xcom_pull(task_ids="create_group_conversation", key="chat_id")
     participant_ids = ti.xcom_pull(task_ids="create_group_conversation", key="participant_ids") or []
 
@@ -264,8 +256,8 @@ def notify_group_participants(**kwargs):
 with DAG(
     dag_id="create_age_filtered_group_chat",
     description=(
-        "Crée une conversation de groupe en filtrant les winkers par âge, "
-        "puis envoie une notification Expo à tous les participants."
+        "Crée une conversation de groupe en filtrant les winkers par année de naissance "
+        "(birthYear -> âge), puis envoie une notification Expo à tous les participants."
     ),
     default_args=default_args,
     schedule_interval=None,  # déclenchement manuel
@@ -273,6 +265,12 @@ with DAG(
     catchup=False,
     max_active_runs=1,
     tags=["chat", "group", "expo", "age_filter"],
+    params={
+        "min_age": Param(18, type="integer", description="Âge minimum"),
+        "max_age": Param(30, type="integer", description="Âge maximum"),
+        "creator_id": Param(1, type="integer", description="ID du winker créateur"),
+        "group_title": Param("Groupe par âge", type="string", description="Titre de la conversation"),
+    },
 ) as dag:
     dag.timezone = PARIS_TZ
 
