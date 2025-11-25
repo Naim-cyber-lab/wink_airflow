@@ -153,11 +153,30 @@ def create_group_conversation(**kwargs):
         raise ValueError("Le paramètre creator_id est obligatoire.") from e
 
     group_title = params.get("group_title") or "Conversation de groupe"
+
+    # 🔒 titreGroupe est un CharField(max_length=50)
+    if len(group_title) > 50:
+        logging.warning(
+            "Titre de groupe trop long (%s caractères), tronqué à 50.",
+            len(group_title),
+        )
+        group_title = group_title[:50]
+
     winker_ids = ti.xcom_pull(task_ids="get_winkers_for_group", key="winker_ids") or []
 
     # Participants finaux = créateur + tous ceux dans la tranche d'âge
     participant_ids = sorted({creator_id, *winker_ids})
     list_id_str = ",".join(str(i) for i in participant_ids)
+
+    # 🔒 listIdGroupWinker est un CharField(max_length=255)
+    if len(list_id_str) > 255:
+        logging.warning(
+            "listIdGroupWinker trop long (%s caractères), tronqué à 255. "
+            "Nombre de participants: %s",
+            len(list_id_str),
+            len(participant_ids),
+        )
+        list_id_str = list_id_str[:255]
 
     with _pg_connect() as connection:
         connection.autocommit = False
