@@ -7,6 +7,7 @@ from airflow import DAG
 from airflow.providers.postgres.operators.postgres import PostgresOperator
 from airflow.operators.python import PythonOperator
 
+# Fuseau horaire Paris
 PARIS_TZ = ZoneInfo("Europe/Paris")
 
 default_args = {
@@ -14,16 +15,18 @@ default_args = {
     "retries": 1,
 }
 
-# ✅ Nom du DAG comme demandé
+# Nom du DAG
 DAG_ID = "confirmModalParticipation"
 
-# ✅ Exécuter toutes les heures, à la minute 0
-# Exemple : 10:00, 11:00, 12:00, ...
+# Planification : toutes les heures à la minute 0
+# 00:00, 01:00, 02:00, ...
 SCHEDULE_CRON = "0 * * * *"
 
-# --- SQL idempotent ---
-# Insère (winker, conversation) uniquement si pas déjà présent dans profil_confirmparticipationmodal,
-# et seulement pour les conversations qui commencent entre maintenant et +2 jours.
+# SQL d'insertion :
+# - On prend toutes les ConversationActivity qui commencent dans les 48h
+# - On prend leurs participants
+# - On insère dans profil_confirmparticipationmodal seulement si l'entrée n'existe pas déjà
+# - created_at est rempli avec NOW() pour respecter le NOT NULL
 SQL_INSERT_CONFIRM_ROWS = """
 WITH target_participants AS (
     SELECT
@@ -44,15 +47,17 @@ to_insert AS (
     WHERE m.id IS NULL
 )
 INSERT INTO profil_confirmparticipationmodal
-    (winker_id, conversation_activity_id, waiting, confirmed)
+    (winker_id, conversation_activity_id, waiting, confirmed, created_at)
 SELECT
     winker_id,
     conversation_id,
     TRUE,       -- waiting par défaut
-    FALSE       -- confirmed par défaut
+    FALSE,      -- confirmed par défaut
+    NOW()       -- created_at non null
 FROM to_insert
 RETURNING 1;
 """
+
 
 def log_insert_count(ti, **_):
     """
@@ -65,6 +70,7 @@ def log_insert_count(ti, **_):
     logging.info(json.dumps(payload, ensure_ascii=False, indent=2))
     logging.info("================================================")
 
+
 with DAG(
     dag_id=DAG_ID,
     schedule_interval=SCHEDULE_CRON,
@@ -72,6 +78,7 @@ with DAG(
     catchup=False,
     tags=["confirm", "participation", "conversations"],
 ) as dag:
+    # On force le fuseau pour le DAG
     dag.timezone = PARIS_TZ
 
     insert_task = PostgresOperator(
@@ -86,4 +93,5 @@ with DAG(
         python_callable=log_insert_count,
     )
 
+    # Ordre d'exécution
     insert_task >> log_task
