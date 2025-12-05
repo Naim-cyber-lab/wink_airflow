@@ -14,10 +14,12 @@ default_args = {
     "retries": 1,
 }
 
-DAG_ID = "insert_confirm_participation_Jmoins2"
+# ✅ Nom du DAG comme demandé
+DAG_ID = "confirmModalParticipation"
 
-# Exécuter chaque jour à 09:00 (Paris)
-SCHEDULE_CRON = "0 9 * * *"
+# ✅ Exécuter toutes les heures, à la minute 0
+# Exemple : 10:00, 11:00, 12:00, ...
+SCHEDULE_CRON = "0 * * * *"
 
 # --- SQL idempotent ---
 # Insère (winker, conversation) uniquement si pas déjà présent dans profil_confirmparticipationmodal,
