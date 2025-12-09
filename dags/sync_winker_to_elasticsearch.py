@@ -174,10 +174,9 @@ def index_winkers_to_es(ti, **_):
 
         # 👉 Pas de doublons :
         #    _id = id du winker, donc un seul doc par winker dans l'index.
-        #    Si tu veux STRICTEMENT ne créer que si absent, remplace "index" par "create".
         actions.append(
             {
-                "_op_type": "index",
+                "_op_type": "index",  # ou "create" si tu veux refuser les updates
                 "_index": INDEX_NAME,
                 "_id": winker_id,
                 "_source": es_doc,
@@ -196,7 +195,7 @@ def index_winkers_to_es(ti, **_):
 with DAG(
     dag_id=DAG_ID,
     default_args=default_args,
-    schedule_interval="@daily",  # à adapter
+    schedule_interval="@daily",  # à adapter si besoin
     catchup=False,
     tags=["winker", "elasticsearch"],
 ) as dag:
@@ -204,7 +203,7 @@ with DAG(
 
     fetch_winkers_from_postgres = PostgresOperator(
         task_id="fetch_winkers_from_postgres",
-        postgres_conn_id="postgres_default",  # adapte au conn_id que tu utilises
+        postgres_conn_id="my_postgres",  # ✅ corrige ici : utilise ta connexion existante
         sql=SQL_SELECT_WINKERS,
         do_xcom_push=True,
     )
