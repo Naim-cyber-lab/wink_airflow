@@ -5,7 +5,8 @@ import logging
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.postgres.operators.postgres import PostgresOperator
-from airflow.providers.elasticsearch.hooks.elasticsearch import ElasticsearchHook
+from airflow.hooks.base import BaseHook  # 👈 pour récupérer la connexion Airflow
+from elasticsearch import Elasticsearch
 from elasticsearch import helpers
 
 
@@ -42,7 +43,31 @@ WHERE is_active = TRUE;
 """
 
 
-def create_index_if_needed(es):
+def get_es_client() -> Elasticsearch:
+    """
+    Construit un client Elasticsearch officiel à partir
+    de la connection Airflow `elasticsearch_default`.
+    """
+    conn = BaseHook.get_connection("elasticsearch_default")
+
+    schema = conn.schema or "http"
+    host = conn.host
+    port = conn.port or 9200
+
+    if conn.login and conn.password:
+        url = f"{schema}://{conn.login}:{conn.password}@{host}:{port}"
+    else:
+        url = f"{schema}://{host}:{port}"
+
+    # Extra peut contenir par ex: {"verify_certs": false}
+    extra = conn.extra_dejson or {}
+
+    # Client officiel Elasticsearch
+    es = Elasticsearch([url], **extra)
+    return es
+
+
+def create_index_if_needed(es: Elasticsearch) -> None:
     """
     Crée l'index `winker` avec TON mapping s'il n'existe pas encore.
     """
@@ -123,9 +148,8 @@ def index_winkers_to_es(ti, **_):
         "last_connection",
     ]
 
-    # Connexion ES via la connexion Airflow (à créer dans l'UI : elasticsearch_default)
-    hook = ElasticsearchHook(elasticsearch_conn_id="elasticsearch_default")
-    es = hook.get_conn()
+    # 🔗 Connexion ES via la connexion Airflow (elasticsearch_default)
+    es = get_es_client()
 
     # Création index si besoin
     create_index_if_needed(es)
@@ -203,7 +227,7 @@ with DAG(
 
     fetch_winkers_from_postgres = PostgresOperator(
         task_id="fetch_winkers_from_postgres",
-        postgres_conn_id="my_postgres",  # ✅ corrige ici : utilise ta connexion existante
+        postgres_conn_id="my_postgres",  # ta connexion Postgres existante
         sql=SQL_SELECT_WINKERS,
         do_xcom_push=True,
     )
