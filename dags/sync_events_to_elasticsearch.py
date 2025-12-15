@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 import logging
 import os
 import json
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
 import requests
 from airflow import DAG
@@ -32,8 +32,7 @@ default_args = {
     "retries": 1,
 }
 
-# ⚠️ colonnes camelCase -> guillemets
-# ⚠️ Si "is_banned" n'existe PAS en DB : remplace COALESCE(is_banned, FALSE) par FALSE AS is_banned
+# ✅ DB: pas de champ is_banned -> on force FALSE
 SQL_SELECT_WINKERS = """
 SELECT
     id,
@@ -48,7 +47,7 @@ SELECT
     sexe,
     comptePro,
     is_active,
-    COALESCE(is_banned, FALSE) AS is_banned,
+    FALSE AS is_banned,
     lat,
     lon,
     derniereRechercheEvent,
@@ -64,9 +63,6 @@ WHERE is_active = TRUE;
 # Elasticsearch helpers
 # -------------------------
 def get_es_client() -> Elasticsearch:
-    """
-    Récupère la connexion Airflow 'elasticsearch_default' et instancie le client ES.
-    """
     conn = BaseHook.get_connection("elasticsearch_default")
 
     schema = conn.schema or "http"
@@ -83,10 +79,6 @@ def get_es_client() -> Elasticsearch:
 
 
 def create_index_if_needed(es: Elasticsearch) -> None:
-    """
-    Crée l'index ES avec TON mapping s'il n'existe pas.
-    Fix principal: configure l'analyzer text_fr (sinon BadRequestError).
-    """
     if es.indices.exists(index=INDEX_NAME):
         logging.info("Index '%s' existe déjà.", INDEX_NAME)
         return
@@ -103,7 +95,7 @@ def create_index_if_needed(es: Elasticsearch) -> None:
                         "filter": ["lowercase", "asciifolding"],
                     }
                 },
-                # ✅ Fix: si un champ référence analyzer "text_fr", ES doit le connaître
+                # ✅ Fix: évite l'erreur si un champ utilise analyzer "text_fr"
                 "analyzer": {
                     "text_fr": {"type": "french"}
                 },
@@ -131,7 +123,6 @@ def create_index_if_needed(es: Elasticsearch) -> None:
 
                 "localisation": {"type": "geo_point"},
 
-                # Tu peux mettre analyzer "text_fr" si tu veux (pas obligatoire)
                 "bio": {"type": "text"},
                 "derniereRechercheEvent": {"type": "text"},
                 "profile_text": {"type": "text"},
@@ -150,8 +141,6 @@ def create_index_if_needed(es: Elasticsearch) -> None:
                 "lastConnection": {"type": "date"},
 
                 "boost": {"type": "float"},
-
-                # ✅ champ propre
                 "updated_at": {"type": "date"},
             },
         },
@@ -174,10 +163,6 @@ def safe_geo(lat: Any, lon: Any) -> Optional[Dict[str, float]]:
 
 
 def parse_vector16(raw: Any) -> Optional[List[float]]:
-    """
-    vectorPreferenceWinker est stocké comme TextField (JSON string) en DB.
-    Convertit en list[float] (len=16) si possible.
-    """
     if raw is None:
         return None
     try:
@@ -198,16 +183,12 @@ def parse_vector16(raw: Any) -> Optional[List[float]]:
 
 
 def build_profile_text(record: Dict[str, Any]) -> str:
-    """
-    Texte stable utilisé pour calculer embedding_vector.
-    """
     parts: List[str] = []
 
     bio = (record.get("bio") or "").strip()
     if bio:
         parts.append(bio)
 
-    # localisation (signal faible)
     city = (record.get("city") or "").strip()
     subregion = (record.get("subregion") or "").strip()
     region = (record.get("region") or "").strip()
@@ -215,7 +196,6 @@ def build_profile_text(record: Dict[str, Any]) -> str:
     if loc:
         parts.append(loc)
 
-    # historique recherche event (signal fort)
     last_search = (record.get("derniereRechercheEvent") or "").strip()
     if last_search and last_search not in ("{}", "[]", "null"):
         parts.append(last_search)
@@ -224,10 +204,6 @@ def build_profile_text(record: Dict[str, Any]) -> str:
 
 
 def get_embedding(text: str) -> Optional[List[float]]:
-    """
-    Appel optionnel à un service d'embeddings.
-    Attend une réponse: {"embedding":[...]} ou {"vector":[...]}.
-    """
     if not EMBEDDINGS_URL:
         return None
 
@@ -246,11 +222,7 @@ def get_embedding(text: str) -> Optional[List[float]]:
 
         out = [float(x) for x in vec]
         if len(out) != EMBEDDINGS_DIMS:
-            logging.warning(
-                "Embedding dims inattendues: %s (attendu %s)",
-                len(out),
-                EMBEDDINGS_DIMS,
-            )
+            logging.warning("Embedding dims inattendues: %s (attendu %s)", len(out), EMBEDDINGS_DIMS)
         return out
     except Exception as e:
         logging.warning("Embedding failed: %s", e)
@@ -310,7 +282,6 @@ def index_winkers_to_es(ti, **_):
 
         localisation = safe_geo(record.get("lat"), record.get("lon"))
         profile_text = build_profile_text(record)
-
         embedding_vector = get_embedding(profile_text) if profile_text else None
         vec16 = parse_vector16(record.get("vectorPreferenceWinker"))
 
@@ -334,13 +305,10 @@ def index_winkers_to_es(ti, **_):
 
             "bio": record.get("bio"),
 
-            # Si tu n’as pas encore de vraie liste de tags: laisse vide
             "preferences": [],
-
             "profile_text": profile_text or "",
 
             "is_connected": bool(record.get("is_connected")),
-            # DB -> last_connection, ES -> lastConnection
             "lastConnection": record.get("last_connection"),
 
             "derniereRechercheEvent": record.get("derniereRechercheEvent"),
@@ -358,7 +326,6 @@ def index_winkers_to_es(ti, **_):
         if embedding_vector is not None:
             es_doc["embedding_vector"] = embedding_vector
         else:
-            # pas bloquant, mais sans ça pas de KNN
             logging.info(
                 "No embedding for winker_id=%s (profile_text empty or embeddings service unavailable).",
                 winker_id,
