@@ -45,13 +45,13 @@ SELECT
     "codePostal",
     pays,
     sexe,
-    comptePro,
+    "comptePro",
     is_active,
     FALSE AS is_banned,
     lat,
     lon,
-    derniereRechercheEvent,
-    vectorPreferenceWinker,
+    "derniereRechercheEvent",
+    "vectorPreferenceWinker",
     is_connected,
     last_connection
 FROM profil_winker
@@ -76,80 +76,6 @@ def get_es_client() -> Elasticsearch:
 
     extra = conn.extra_dejson or {}
     return Elasticsearch([url], **extra)
-
-
-def create_index_if_needed(es: Elasticsearch) -> None:
-    """
-    Crée l'index ES si absent, avec le mapping cible.
-    ✅ Fix: on déclare l'analyzer text_fr (sinon 400 si un champ le référence).
-    """
-    if es.indices.exists(index=INDEX_NAME):
-        logging.info("Index '%s' existe déjà.", INDEX_NAME)
-        return
-
-    logging.info("Index '%s' absent -> création.", INDEX_NAME)
-
-    body: Dict[str, Any] = {
-        "settings": {
-            "index": {"number_of_shards": 1, "number_of_replicas": 0},
-            "analysis": {
-                "normalizer": {
-                    "lc_norm": {
-                        "type": "custom",
-                        "filter": ["lowercase", "asciifolding"],
-                    }
-                },
-                "analyzer": {
-                    "text_fr": {"type": "french"}
-                },
-            },
-        },
-        "mappings": {
-            "dynamic": "false",
-            "properties": {
-                "winker_id": {"type": "integer"},
-                "username": {"type": "keyword", "normalizer": "lc_norm"},
-
-                "comptePro": {"type": "boolean"},
-                "is_active": {"type": "boolean"},
-                "is_banned": {"type": "boolean"},
-
-                "sexe": {"type": "keyword"},
-                "age": {"type": "short"},
-                "birthYear": {"type": "short"},
-
-                "city": {"type": "keyword", "normalizer": "lc_norm"},
-                "region": {"type": "keyword", "normalizer": "lc_norm"},
-                "subregion": {"type": "keyword", "normalizer": "lc_norm"},
-                "pays": {"type": "keyword", "normalizer": "lc_norm"},
-                "codePostal": {"type": "keyword"},
-
-                "localisation": {"type": "geo_point"},
-
-                "bio": {"type": "text"},
-                "preferences": {"type": "keyword"},
-                "vectorPreferenceWinker": {"type": "dense_vector", "dims": 16, "index": False},
-
-                "profile_text": {"type": "text"},
-                "embedding_vector": {
-                    "type": "dense_vector",
-                    "dims": EMBEDDINGS_DIMS,
-                    "index": True,
-                    "similarity": "cosine",
-                },
-
-                "is_connected": {"type": "boolean"},
-                "lastConnection": {"type": "date"},
-
-                "derniereRechercheEvent": {"type": "text"},
-                "boost": {"type": "float"},
-                "updated_at": {"type": "date"},
-            }
-        },
-    }
-
-    es.indices.create(index=INDEX_NAME, body=body)
-    logging.info("Index '%s' créé.", INDEX_NAME)
 
 
 def safe_geo(lat: Any, lon: Any) -> Optional[Dict[str, float]]:
@@ -266,7 +192,6 @@ def index_winkers_to_es(ti, **_):
     ]
 
     es = get_es_client()
-    create_index_if_needed(es)
 
     current_year = date.today().year
     now_iso = datetime.now(tz=PARIS_TZ).isoformat()
