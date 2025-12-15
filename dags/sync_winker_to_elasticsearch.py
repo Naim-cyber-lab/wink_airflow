@@ -1,28 +1,38 @@
+from __future__ import annotations
+
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 import logging
+import os
+import json
+from typing import Any, Dict, List, Optional
 
+import requests
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.postgres.operators.postgres import PostgresOperator
-from airflow.hooks.base import BaseHook  # 👈 pour récupérer la connexion Airflow
-from elasticsearch import Elasticsearch
-from elasticsearch import helpers
+from airflow.hooks.base import BaseHook
+from elasticsearch import Elasticsearch, helpers
 
 
 PARIS_TZ = ZoneInfo("Europe/Paris")
 DAG_ID = "sync_winker_to_elasticsearch"
-INDEX_NAME = "winker"  # ton index ES
+
+# ✅ IMPORTANT : ton index final
+INDEX_NAME = "nisu_winkers"
+
+# Embeddings (optionnel mais recommandé)
+EMBEDDINGS_URL = os.getenv("EMBEDDINGS_URL", "").strip()
+EMBEDDINGS_TIMEOUT = int(os.getenv("EMBEDDINGS_TIMEOUT", "60"))
+EMBEDDINGS_DIMS = int(os.getenv("EMBEDDINGS_DIMS", "768"))
 
 default_args = {
     "start_date": datetime(2024, 1, 1),
     "retries": 1,
 }
 
-# ⚠️ IMPORTANT :
-# Les colonnes en camelCase dans Django sont en réalité
-# créées avec des guillemets en SQL → il faut les citer:
-# "birthYear", "codePostal", "photoProfil"
+# ✅ DB: pas de champ is_banned -> on force FALSE
+# ⚠️ Si certains champs n'existent pas (ex: comptePro, vectorPreferenceWinker...), enlève-les du SELECT.
 SQL_SELECT_WINKERS = """
 SELECT
     id,
@@ -30,13 +40,19 @@ SELECT
     bio,
     "birthYear",
     city,
+    region,
+    subregion,
     "codePostal",
     pays,
-    "photoProfil",
-    region,
     sexe,
+    comptePro,
+    is_active,
+    FALSE AS is_banned,
     lat,
     lon,
+    derniereRechercheEvent,
+    vectorPreferenceWinker,
+    is_connected,
     last_connection
 FROM profil_winker
 WHERE is_active = TRUE;
@@ -45,8 +61,7 @@ WHERE is_active = TRUE;
 
 def get_es_client() -> Elasticsearch:
     """
-    Construit un client Elasticsearch officiel à partir
-    de la connection Airflow `elasticsearch_default`.
+    Client ES depuis la connexion Airflow `elasticsearch_default`.
     """
     conn = BaseHook.get_connection("elasticsearch_default")
 
@@ -59,74 +74,170 @@ def get_es_client() -> Elasticsearch:
     else:
         url = f"{schema}://{host}:{port}"
 
-    # Extra peut contenir par ex: {"verify_certs": false}
     extra = conn.extra_dejson or {}
-
-    # Client officiel Elasticsearch
-    es = Elasticsearch([url], **extra)
-    return es
+    return Elasticsearch([url], **extra)
 
 
 def create_index_if_needed(es: Elasticsearch) -> None:
     """
-    Crée l'index `winker` avec TON mapping s'il n'existe pas encore.
+    Crée l'index ES si absent, avec le mapping cible.
+    ✅ Fix: on déclare l'analyzer text_fr (sinon 400 si un champ le référence).
     """
     if es.indices.exists(index=INDEX_NAME):
-        logging.info("Index '%s' existe déjà, on ne le recrée pas.", INDEX_NAME)
+        logging.info("Index '%s' existe déjà.", INDEX_NAME)
         return
 
-    logging.info("Index '%s' n'existe pas, création avec le mapping fourni...", INDEX_NAME)
+    logging.info("Index '%s' absent -> création.", INDEX_NAME)
 
-    body = {
+    body: Dict[str, Any] = {
+        "settings": {
+            "index": {"number_of_shards": 1, "number_of_replicas": 0},
+            "analysis": {
+                "normalizer": {
+                    "lc_norm": {
+                        "type": "custom",
+                        "filter": ["lowercase", "asciifolding"],
+                    }
+                },
+                "analyzer": {
+                    "text_fr": {"type": "french"}
+                },
+            },
+        },
         "mappings": {
+            "dynamic": "false",
             "properties": {
-                "age": {"type": "integer"},
-                "bio": {"type": "text", "analyzer": "text_fr"},
-                "birthYear": {"type": "integer"},
-                "city": {
-                    "type": "text",
-                    "analyzer": "text_fr",
-                    "fields": {
-                        "keyword": {"type": "keyword"}
-                    },
-                },
-                "codePostal": {"type": "keyword"},
-                "fun_free_text": {"type": "text", "analyzer": "text_fr"},
-                "fun_options": {"type": "keyword"},
-                "fun_questions": {"type": "keyword"},
-                "fun_sections": {"type": "keyword"},
-                "id": {"type": "integer"},
-                "last_connection": {"type": "date"},
-                "location": {"type": "geo_point"},
-                "pays": {"type": "keyword"},
-                "photoProfil": {"type": "keyword"},
-                "preferences": {"type": "keyword"},
-                "preferences_raw": {"type": "text"},
-                "region": {"type": "keyword"},
+                "winker_id": {"type": "integer"},
+                "username": {"type": "keyword", "normalizer": "lc_norm"},
+
+                "comptePro": {"type": "boolean"},
+                "is_active": {"type": "boolean"},
+                "is_banned": {"type": "boolean"},
+
                 "sexe": {"type": "keyword"},
-                "username": {
-                    "type": "text",
-                    "analyzer": "text_fr",
-                    "fields": {
-                        "keyword": {
-                            "type": "keyword",
-                            "ignore_above": 256,
-                        }
-                    },
+                "age": {"type": "short"},
+                "birthYear": {"type": "short"},
+
+                "city": {"type": "keyword", "normalizer": "lc_norm"},
+                "region": {"type": "keyword", "normalizer": "lc_norm"},
+                "subregion": {"type": "keyword", "normalizer": "lc_norm"},
+                "pays": {"type": "keyword", "normalizer": "lc_norm"},
+                "codePostal": {"type": "keyword"},
+
+                "localisation": {"type": "geo_point"},
+
+                "bio": {"type": "text"},
+                "preferences": {"type": "keyword"},
+                "vectorPreferenceWinker": {"type": "dense_vector", "dims": 16, "index": False},
+
+                "profile_text": {"type": "text"},
+                "embedding_vector": {
+                    "type": "dense_vector",
+                    "dims": EMBEDDINGS_DIMS,
+                    "index": True,
+                    "similarity": "cosine",
                 },
+
+                "is_connected": {"type": "boolean"},
+                "lastConnection": {"type": "date"},
+
+                "derniereRechercheEvent": {"type": "text"},
+                "boost": {"type": "float"},
+                "updated_at": {"type": "date"},
             }
-        }
+        },
     }
 
     es.indices.create(index=INDEX_NAME, body=body)
     logging.info("Index '%s' créé.", INDEX_NAME)
 
 
+def safe_geo(lat: Any, lon: Any) -> Optional[Dict[str, float]]:
+    if lat is None or lon is None:
+        return None
+    try:
+        return {"lat": float(lat), "lon": float(lon)}
+    except Exception:
+        return None
+
+
+def parse_vector16(raw: Any) -> Optional[List[float]]:
+    """
+    vectorPreferenceWinker : souvent une string JSON "[...]" de 16 floats.
+    """
+    if raw is None:
+        return None
+    try:
+        if isinstance(raw, list):
+            vec = raw
+        else:
+            s = str(raw).strip()
+            if not s or s in ("null", "[]", "{}"):
+                return None
+            vec = json.loads(s)
+
+        if not isinstance(vec, list) or len(vec) != 16:
+            return None
+        return [float(x) for x in vec]
+    except Exception:
+        return None
+
+
+def build_profile_text(record: Dict[str, Any]) -> str:
+    """
+    Texte stable utilisé pour l'embedding KNN.
+    """
+    parts: List[str] = []
+
+    bio = (record.get("bio") or "").strip()
+    if bio:
+        parts.append(bio)
+
+    city = (record.get("city") or "").strip()
+    subregion = (record.get("subregion") or "").strip()
+    region = (record.get("region") or "").strip()
+    loc = " ".join([p for p in [city, subregion, region] if p])
+    if loc:
+        parts.append(loc)
+
+    last_search = (record.get("derniereRechercheEvent") or "").strip()
+    if last_search and last_search not in ("{}", "[]", "null"):
+        parts.append(last_search)
+
+    return " | ".join(parts).strip()
+
+
+def get_embedding(text: str) -> Optional[List[float]]:
+    """
+    Service embeddings (optionnel).
+    Attend {"embedding":[...]} ou {"vector":[...]}.
+    """
+    if not EMBEDDINGS_URL:
+        return None
+
+    try:
+        r = requests.post(
+            EMBEDDINGS_URL,
+            json={"text": text},
+            timeout=EMBEDDINGS_TIMEOUT,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        vec = data.get("embedding") or data.get("vector")
+        if not isinstance(vec, list) or not vec:
+            return None
+
+        out = [float(x) for x in vec]
+        if len(out) != EMBEDDINGS_DIMS:
+            logging.warning("Embedding dims inattendues: %s (attendu %s)", len(out), EMBEDDINGS_DIMS)
+        return out
+    except Exception as e:
+        logging.warning("Embedding failed: %s", e)
+        return None
+
+
 def index_winkers_to_es(ti, **_):
-    """
-    Récupère les winkers depuis Postgres (via XCom) et les indexe dans ES.
-    Aucun doublon : on utilise _id = id du Winker.
-    """
     rows = ti.xcom_pull(task_ids="fetch_winkers_from_postgres") or []
     if not rows:
         logging.info("Aucun winker retourné par la requête SQL.")
@@ -138,29 +249,34 @@ def index_winkers_to_es(ti, **_):
         "bio",
         "birthYear",
         "city",
+        "region",
+        "subregion",
         "codePostal",
         "pays",
-        "photoProfil",
-        "region",
         "sexe",
+        "comptePro",
+        "is_active",
+        "is_banned",
         "lat",
         "lon",
+        "derniereRechercheEvent",
+        "vectorPreferenceWinker",
+        "is_connected",
         "last_connection",
     ]
 
-    # 🔗 Connexion ES via la connexion Airflow (elasticsearch_default)
     es = get_es_client()
-
-    # Création index si besoin
     create_index_if_needed(es)
 
     current_year = date.today().year
-    actions = []
+    now_iso = datetime.now(tz=PARIS_TZ).isoformat()
+
+    actions: List[Dict[str, Any]] = []
 
     for row in rows:
         record = {col_names[i]: row[i] for i in range(len(col_names))}
+        winker_id = int(record["id"])
 
-        winker_id = record["id"]
         birth_year = record.get("birthYear")
         age = None
         if birth_year:
@@ -169,40 +285,65 @@ def index_winkers_to_es(ti, **_):
             except Exception:
                 age = None
 
-        lat = record.get("lat")
-        lon = record.get("lon")
-        location = None
-        if lat is not None and lon is not None:
-            try:
-                location = {"lat": float(lat), "lon": float(lon)}
-            except Exception:
-                location = None
+        localisation = safe_geo(record.get("lat"), record.get("lon"))
 
-        es_doc = {
-            "id": winker_id,
+        profile_text = build_profile_text(record)
+        embedding_vector = get_embedding(profile_text) if profile_text else None
+        vec16 = parse_vector16(record.get("vectorPreferenceWinker"))
+
+        es_doc: Dict[str, Any] = {
+            "winker_id": winker_id,
             "username": record.get("username"),
-            "bio": record.get("bio"),
+
+            "comptePro": bool(record.get("comptePro")),
+            "is_active": bool(record.get("is_active")),
+            "is_banned": bool(record.get("is_banned")),
+
+            "sexe": record.get("sexe"),
             "birthYear": birth_year,
             "age": age,
+
             "city": record.get("city"),
+            "region": record.get("region"),
+            "subregion": record.get("subregion"),
             "codePostal": record.get("codePostal"),
             "pays": record.get("pays"),
-            "photoProfil": str(record.get("photoProfil")) if record.get("photoProfil") else None,
-            "region": record.get("region"),
-            "sexe": record.get("sexe"),
-            "last_connection": record.get("last_connection"),
+
+            "bio": record.get("bio"),
+
+            # si tu n’as pas encore de vraie liste de tags, laisse vide
+            "preferences": [],
+
+            "profile_text": profile_text or "",
+
+            "is_connected": bool(record.get("is_connected")),
+            "lastConnection": record.get("last_connection"),
+
+            "derniereRechercheEvent": record.get("derniereRechercheEvent"),
+
+            "boost": 0.0,
+            "updated_at": now_iso,
         }
 
-        if location:
-            es_doc["location"] = location
+        if localisation:
+            es_doc["localisation"] = localisation
 
-        # 👉 Pas de doublons :
-        #    _id = id du winker, donc un seul doc par winker dans l'index.
+        if vec16 is not None:
+            es_doc["vectorPreferenceWinker"] = vec16
+
+        if embedding_vector is not None:
+            es_doc["embedding_vector"] = embedding_vector
+        else:
+            logging.info(
+                "No embedding for winker_id=%s (profile_text empty or embeddings service unavailable).",
+                winker_id,
+            )
+
         actions.append(
             {
-                "_op_type": "index",  # ou "create" si tu veux refuser les updates
+                "_op_type": "index",
                 "_index": INDEX_NAME,
-                "_id": winker_id,
+                "_id": str(winker_id),  # ✅ un doc par winker
                 "_source": es_doc,
             }
         )
@@ -211,15 +352,15 @@ def index_winkers_to_es(ti, **_):
         logging.info("Aucune action à envoyer vers Elasticsearch.")
         return
 
-    logging.info("Indexation de %d winkers dans Elasticsearch...", len(actions))
-    helpers.bulk(es, actions)
+    logging.info("Indexation de %d winkers dans Elasticsearch (%s)...", len(actions), INDEX_NAME)
+    helpers.bulk(es, actions, request_timeout=120)
     logging.info("Indexation terminée.")
 
 
 with DAG(
     dag_id=DAG_ID,
     default_args=default_args,
-    schedule_interval="@daily",  # à adapter si besoin
+    schedule_interval="@daily",
     catchup=False,
     tags=["winker", "elasticsearch"],
 ) as dag:
@@ -227,7 +368,7 @@ with DAG(
 
     fetch_winkers_from_postgres = PostgresOperator(
         task_id="fetch_winkers_from_postgres",
-        postgres_conn_id="my_postgres",  # ta connexion Postgres existante
+        postgres_conn_id="my_postgres",
         sql=SQL_SELECT_WINKERS,
         do_xcom_push=True,
     )
