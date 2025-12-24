@@ -22,18 +22,26 @@ SCHEDULE_CRON = "20 * * * *"
 # Attention : ConversationActivity utilise lat / lng (pas lon)
 # On ignore les conversations supprimées si tu as is_deleted
 SQL_UPDATE_CONV_BASE_POINT = """
+WITH computed AS (
+  SELECT
+    c.id AS conversation_id,
+    (
+      SELECT b.id
+      FROM profil_basepoint b
+      ORDER BY ((b.lat - c.lat)*(b.lat - c.lat) + (b.lon - c.lng)*(b.lon - c.lng)) ASC
+      LIMIT 1
+    ) AS new_base_point_id
+  FROM profil_conversationactivity c
+  WHERE c.lat IS NOT NULL
+    AND c.lng IS NOT NULL
+    AND (c.is_deleted IS NULL OR c.is_deleted = FALSE)
+)
 UPDATE profil_conversationactivity c
-SET base_point_id = bp.id
-FROM LATERAL (
-    SELECT b.id
-    FROM profil_basepoint b
-    ORDER BY ((b.lat - c.lat)*(b.lat - c.lat) + (b.lon - c.lng)*(b.lon - c.lng)) ASC
-    LIMIT 1
-) bp
-WHERE c.base_point_id IS NULL
-  AND c.lat IS NOT NULL
-  AND c.lng IS NOT NULL
-  AND (c.is_deleted IS NULL OR c.is_deleted = FALSE)
+SET base_point_id = computed.new_base_point_id
+FROM computed
+WHERE c.id = computed.conversation_id
+  AND computed.new_base_point_id IS NOT NULL
+  AND c.base_point_id IS DISTINCT FROM computed.new_base_point_id
 RETURNING c.id;
 """
 

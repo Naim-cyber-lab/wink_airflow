@@ -22,18 +22,27 @@ SCHEDULE_CRON = "10 * * * *"
 # Met à jour uniquement les winkers qui n'ont pas encore de base_point_id
 # + qui ont lat/lon
 SQL_UPDATE_WINKER_BASE_POINT = """
+WITH computed AS (
+  SELECT
+    w.id AS winker_id,
+    (
+      SELECT b.id
+      FROM profil_basepoint b
+      ORDER BY ((b.lat - w.lat)*(b.lat - w.lat) + (b.lon - w.lon)*(b.lon - w.lon)) ASC
+      LIMIT 1
+    ) AS new_base_point_id
+  FROM profil_winker w
+  WHERE w.lat IS NOT NULL
+    AND w.lon IS NOT NULL
+)
 UPDATE profil_winker w
-SET base_point_id = bp.id
-FROM LATERAL (
-    SELECT b.id
-    FROM profil_basepoint b
-    ORDER BY ((b.lat - w.lat)*(b.lat - w.lat) + (b.lon - w.lon)*(b.lon - w.lon)) ASC
-    LIMIT 1
-) bp
-WHERE w.base_point_id IS NULL
-  AND w.lat IS NOT NULL
-  AND w.lon IS NOT NULL
+SET base_point_id = computed.new_base_point_id
+FROM computed
+WHERE w.id = computed.winker_id
+  AND computed.new_base_point_id IS NOT NULL
+  AND w.base_point_id IS DISTINCT FROM computed.new_base_point_id
 RETURNING w.id;
+
 """
 
 def log_updated_count(ti, **_):
