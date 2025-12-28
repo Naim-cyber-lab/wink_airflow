@@ -1,262 +1,218 @@
-from zoneinfo import ZoneInfo
+from __future__ import annotations
+
 from datetime import datetime
-import json
+from zoneinfo import ZoneInfo
 import logging
-import os
-from typing import Any, List, Dict
+import json
+from typing import Any, Dict, List
 
 import requests
+
 from airflow import DAG
-from airflow.providers.postgres.operators.postgres import PostgresOperator
 from airflow.operators.python import PythonOperator
+from airflow.providers.postgres.operators.postgres import PostgresOperator
+from airflow.hooks.base import BaseHook
+
+from elasticsearch import Elasticsearch, helpers
+
 
 PARIS_TZ = ZoneInfo("Europe/Paris")
 
+DAG_ID = "sync_events_to_elasticsearch"
+# ✅ index dédié reco pour NE PAS écraser l’index canonique "nisu_events"
+INDEX_NAME = "nisu_events_reco"
+
+# endpoint embeddings (si 404 -> on continue sans embeddings)
+EMBEDDINGS_URL = "https://recommendation.nisu.fr/api/v1/recommendations/embeddings"
+EMBEDDINGS_TIMEOUT = 60
+EMBEDDING_DIMS = 768
+
 default_args = {
-    "start_date": datetime(2023, 1, 1),
+    "start_date": datetime(2024, 1, 1, tzinfo=PARIS_TZ),
     "retries": 1,
 }
 
-DAG_ID = "sync_postgres_to_es_winkers_events"
-SCHEDULE_CRON = "0 3 * * *"
-POSTGRES_CONN_ID = "my_postgres"
-FASTAPI_BASE_URL = os.environ.get("NISU_RECO_API_URL", "http://nisu-recommendation:8000")
-
-SQL_SELECT_WINKERS_FOR_ES = """
+SQL_SELECT_EVENTS = """
 SELECT
-    id,
-    username,
-    email,
-    sexe,
-    age,
-    city,
-    region,
-    subregion,
-    pays,
-    latitude,
-    longitude,
-    visible_tags,
-    preference_vector,
-    meet_eligible,
-    mails_eligible
-FROM profil_winker_for_es_sync;
+  id,
+  "creatorWinker_id" AS winker_id,
+  titre,
+  "bioEvent" AS bio,
+  "hastagEvents" AS preferences,
+  0 AS boost,
+  lat,
+  lon
+FROM profil_event;
 """
 
-# ⚠️ pas besoin de changer la requête SQL: tu as déjà "id" en 1ère colonne.
-SQL_SELECT_EVENTS_FOR_ES = """
-SELECT
-    id,
-    titre,
-    bio_event,
-    city,
-    region,
-    subregion,
-    pays,
-    code_postal,
-    latitude,
-    longitude,
-    date_event,
-    date_publication,
-    age_minimum,
-    age_maximum,
-    access_fille,
-    access_garcon,
-    access_tous,
-    hashtag_events,
-    meet_eligible,
-    plan_trip_elligible,
-    current_nb_participants,
-    max_number_participant,
-    is_full,
-    vector_preference_event
-FROM profil_event_for_es_sync;
-"""
 
-def _convert_pg_value(val: Any) -> Any:
-    if isinstance(val, str):
-        val_strip = val.strip()
-        if (val_strip.startswith("[") and val_strip.endswith("]")) or \
-           (val_strip.startswith("{") and val_strip.endswith("}")):
+def get_es_client() -> Elasticsearch:
+    conn = BaseHook.get_connection("elasticsearch_default")
+    schema = conn.schema or "http"
+    host = conn.host
+    port = conn.port or 9200
+
+    if conn.login and conn.password:
+        url = f"{schema}://{conn.login}:{conn.password}@{host}:{port}"
+    else:
+        url = f"{schema}://{host}:{port}"
+
+    extra = conn.extra_dejson or {}
+    return Elasticsearch([url], **extra)
+
+
+def _parse_preferences(value: Any) -> List[str]:
+    """
+    hastagEvents: parfois string, parfois JSON, parfois CSV.
+    On normalise en list[str].
+    """
+    if value is None:
+        return []
+
+    if isinstance(value, (list, tuple, set)):
+        return [str(x).strip().lstrip("#") for x in value if str(x).strip()]
+
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return []
+
+        # JSON list ?
+        if s.startswith("[") and s.endswith("]"):
             try:
-                return json.loads(val_strip)
+                data = json.loads(s)
+                if isinstance(data, list):
+                    return [str(x).strip().lstrip("#") for x in data if str(x).strip()]
             except Exception:
-                return val
-    return val
+                pass
 
-def build_winkers_payload(rows: List[tuple]) -> List[Dict[str, Any]]:
-    payload = []
-    for row in rows:
-        (
-            id_,
-            username,
-            email,
-            sexe,
-            age,
-            city,
-            region,
-            subregion,
-            pays,
-            lat,
-            lon,
-            visible_tags,
-            preference_vector,
-            meet_eligible,
-            mails_eligible,
-        ) = row
+        # CSV ?
+        if "," in s:
+            return [x.strip().lstrip("#") for x in s.split(",") if x.strip()]
 
-        payload.append(
-            {
-                "id": id_,
-                "username": username,
-                "email": email,
-                "sexe": sexe,
-                "age": age,
-                "city": city,
-                "region": region,
-                "subregion": subregion,
-                "pays": pays,
-                "lat": lat,
-                "lon": lon,
-                "visible_tags": _convert_pg_value(visible_tags) or [],
-                "preference_vector": _convert_pg_value(preference_vector),
-                "meet_eligible": meet_eligible,
-                "mails_eligible": mails_eligible,
-            }
-        )
-    return payload
+        # hashtags séparés par espaces
+        if " " in s and "#" in s:
+            parts = [p.strip() for p in s.split(" ") if p.strip()]
+            return [p.lstrip("#") for p in parts]
 
-def build_events_payload(rows: List[tuple]) -> List[Dict[str, Any]]:
-    """
-    ✅ Ajout de event_id (keyword) : on le met en string pour être safe.
-    """
-    payload = []
-    for row in rows:
-        (
-            id_,
-            titre,
-            bio_event,
-            city,
-            region,
-            subregion,
-            pays,
-            code_postal,
-            lat,
-            lon,
-            date_event,
-            date_publication,
-            age_minimum,
-            age_maximum,
-            access_fille,
-            access_garcon,
-            access_tous,
-            hashtag_events,
-            meet_eligible,
-            plan_trip_elligible,
-            current_nb_participants,
-            max_number_participant,
-            is_full,
-            vector_preference_event,
-        ) = row
+        return [s.lstrip("#")]
 
-        payload.append(
-            {
-                # ancien champ si ton API FastAPI l’attend
-                "id": id_,
+    s = str(value).strip()
+    return [s.lstrip("#")] if s else []
 
-                # ✅ nouveau champ ES (mapping keyword)
-                "event_id": str(id_) if id_ is not None else None,
 
-                "titre": titre,
-                "bioEvent": bio_event,
-                "city": city,
-                "region": region,
-                "subregion": subregion,
-                "pays": pays,
-                "codePostal": code_postal,
-                "lat": lat,
-                "lon": lon,
-                "dateEvent": date_event.isoformat() if date_event else None,
-                "datePublication": date_publication.isoformat() if date_publication else None,
-                "ageMinimum": age_minimum,
-                "ageMaximum": age_maximum,
-                "accessFille": access_fille,
-                "accessGarcon": access_garcon,
-                "accessTous": access_tous,
-                "hastagEvents": _convert_pg_value(hashtag_events) or [],
-                "meetEligible": meet_eligible,
-                "planTripElligible": plan_trip_elligible,
-                "currentNbParticipants": current_nb_participants,
-                "maxNumberParticipant": max_number_participant,
-                "isFull": is_full,
-                "vectorPreferenceEvent": _convert_pg_value(vector_preference_event),
-            }
-        )
-    return payload
+def _embedding(text: str) -> List[float]:
+    if not text:
+        return []
 
-def push_winkers_to_es(ti, **_):
-    rows = ti.xcom_pull(task_ids="fetch_winkers_task") or []
-    logging.info(f"[WINKERS] {len(rows)} rows fetched from Postgres")
+    r = requests.post(
+        EMBEDDINGS_URL,
+        json={"text": text},
+        timeout=EMBEDDINGS_TIMEOUT,
+    )
+    r.raise_for_status()
 
-    payload = build_winkers_payload(rows)
-    if not payload:
-        logging.info("[WINKERS] Nothing to send to ES")
+    data = r.json()
+    vec = data.get("embedding") or []
+    if not isinstance(vec, list):
+        return []
+
+    if len(vec) != EMBEDDING_DIMS:
+        logging.warning("Embedding dims mismatch: got=%s expected=%s", len(vec), EMBEDDING_DIMS)
+
+    return vec
+
+
+def index_events_to_es(ti, **_):
+    rows = ti.xcom_pull(task_ids="fetch_events_from_postgres") or []
+    if not rows:
+        logging.info("Aucun event à indexer.")
         return
 
-    url = f"{FASTAPI_BASE_URL}/api/v1/index/winkers/bulk"
-    logging.info(f"[WINKERS] Sending {len(payload)} documents to {url}")
+    col_names = ["id", "winker_id", "titre", "bio", "preferences", "boost", "lat", "lon"]
+    es = get_es_client()
 
-    resp = requests.post(url, json=payload, timeout=60)
-    resp.raise_for_status()
-    logging.info(f"[WINKERS] ES index response: {resp.status_code} - {resp.text}")
+    actions = []
 
-def push_events_to_es(ti, **_):
-    rows = ti.xcom_pull(task_ids="fetch_events_task") or []
-    logging.info(f"[EVENTS] {len(rows)} rows fetched from Postgres")
+    for row in rows:
+        rec = {col_names[i]: row[i] for i in range(len(col_names))}
 
-    payload = build_events_payload(rows)
-    if not payload:
-        logging.info("[EVENTS] Nothing to send to ES")
-        return
+        event_id = rec["id"]  # ✅ id profil_event
+        winker_id = rec.get("winker_id")
+        titre = rec.get("titre") or ""
+        bio = rec.get("bio") or ""
+        preferences = _parse_preferences(rec.get("preferences"))
+        boost = rec.get("boost") or 0
 
-    url = f"{FASTAPI_BASE_URL}/api/v1/index/events/bulk"
-    logging.info(f"[EVENTS] Sending {len(payload)} documents to {url}")
+        lat = rec.get("lat")
+        lon = rec.get("lon")
+        localisation = None
+        if lat is not None and lon is not None:
+            try:
+                localisation = {"lat": float(lat), "lon": float(lon)}
+            except Exception:
+                localisation = None
 
-    resp = requests.post(url, json=payload, timeout=60)
-    resp.raise_for_status()
-    logging.info(f"[EVENTS] ES index response: {resp.status_code} - {resp.text}")
+        preferences_text = ", ".join(preferences) if preferences else ""
+        merged_text = " ".join([x for x in [titre, bio, preferences_text] if x]).strip()
+
+        # ✅ embeddings : si 404 / erreur -> on ne casse pas l’indexation
+        merged_vec: List[float] = []
+        if merged_text:
+            try:
+                merged_vec = _embedding(merged_text)
+            except Exception as e:
+                logging.exception("Erreur embedding event_id=%s: %s", event_id, e)
+                merged_vec = []
+
+        # ✅ doc RECO (dans index dédié)
+        doc: Dict[str, Any] = {
+            "event_id": str(event_id),  # ✅ champ existant, requêtable via exists
+            "winkerId": str(winker_id) if winker_id is not None else None,
+            "boost": int(boost),
+            "titre": titre,
+            "bio": bio,
+            "preferences": preferences,
+        }
+
+        if localisation:
+            doc["localisation"] = localisation
+
+        if merged_vec:
+            doc["embedding_vector"] = merged_vec
+
+        actions.append(
+            {
+                "_op_type": "index",
+                "_index": INDEX_NAME,
+                "_id": str(event_id),  # ✅ ES _id = id profil_event
+                "_source": doc,
+            }
+        )
+
+    helpers.bulk(es, actions)
+    logging.info("Indexation terminée: %d docs -> index=%s", len(actions), INDEX_NAME)
+
 
 with DAG(
     dag_id=DAG_ID,
-    schedule_interval=SCHEDULE_CRON,
     default_args=default_args,
+    schedule_interval="@daily",
     catchup=False,
-    tags=["sync", "elasticsearch", "winker", "event"],
+    tags=["events", "elasticsearch", "reco"],
 ) as dag:
     dag.timezone = PARIS_TZ
 
-    fetch_winkers_task = PostgresOperator(
-        task_id="fetch_winkers_task",
-        postgres_conn_id=POSTGRES_CONN_ID,
-        sql=SQL_SELECT_WINKERS_FOR_ES,
+    fetch_events_from_postgres = PostgresOperator(
+        task_id="fetch_events_from_postgres",
+        postgres_conn_id="my_postgres",
+        sql=SQL_SELECT_EVENTS,
         do_xcom_push=True,
     )
 
-    push_winkers_task = PythonOperator(
-        task_id="push_winkers_to_es",
-        python_callable=push_winkers_to_es,
+    index_events_to_elasticsearch = PythonOperator(
+        task_id="index_events_to_elasticsearch",
+        python_callable=index_events_to_es,
     )
 
-    fetch_events_task = PostgresOperator(
-        task_id="fetch_events_task",
-        postgres_conn_id=POSTGRES_CONN_ID,
-        sql=SQL_SELECT_EVENTS_FOR_ES,
-        do_xcom_push=True,
-    )
-
-    push_events_task = PythonOperator(
-        task_id="push_events_to_es",
-        python_callable=push_events_to_es,
-    )
-
-    fetch_winkers_task >> push_winkers_task
-    fetch_events_task >> push_events_task
+    fetch_events_from_postgres >> index_events_to_elasticsearch
