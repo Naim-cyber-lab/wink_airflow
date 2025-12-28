@@ -12,32 +12,15 @@ from airflow.operators.python import PythonOperator
 
 PARIS_TZ = ZoneInfo("Europe/Paris")
 
-# =====================================================================
-# Config de base
-# =====================================================================
-
 default_args = {
     "start_date": datetime(2023, 1, 1),
     "retries": 1,
 }
 
 DAG_ID = "sync_postgres_to_es_winkers_events"
-
-# Exécution quotidienne à 3h du matin (Paris)
 SCHEDULE_CRON = "0 3 * * *"
-
-# Connexion Postgres (à adapter à ton conn_id Airflow)
 POSTGRES_CONN_ID = "my_postgres"
-
-# URL de ton service FastAPI de reco (à adapter)
-# Exemple si tu es en local :
-# FASTAPI_BASE_URL = "http://localhost:8000"
 FASTAPI_BASE_URL = os.environ.get("NISU_RECO_API_URL", "http://nisu-recommendation:8000")
-
-# =====================================================================
-# SQL : à adapter selon ton schéma / vues
-# L'idée : tu peux créer des VUES déjà "propres" pour ES.
-# =====================================================================
 
 SQL_SELECT_WINKERS_FOR_ES = """
 SELECT
@@ -50,15 +33,16 @@ SELECT
     region,
     subregion,
     pays,
-    latitude,           -- à adapter: lat
-    longitude,          -- à adapter: lon
-    visible_tags,       -- ex: JSON ou ARRAY
-    preference_vector,  -- ex: JSON ou ARRAY (16 dims)
+    latitude,
+    longitude,
+    visible_tags,
+    preference_vector,
     meet_eligible,
     mails_eligible
 FROM profil_winker_for_es_sync;
 """
 
+# ⚠️ pas besoin de changer la requête SQL: tu as déjà "id" en 1ère colonne.
 SQL_SELECT_EVENTS_FOR_ES = """
 SELECT
     id,
@@ -69,8 +53,8 @@ SELECT
     subregion,
     pays,
     code_postal,
-    latitude,               -- lat
-    longitude,              -- lon
+    latitude,
+    longitude,
     date_event,
     date_publication,
     age_minimum,
@@ -78,26 +62,17 @@ SELECT
     access_fille,
     access_garcon,
     access_tous,
-    hashtag_events,         -- JSON ou ARRAY
+    hashtag_events,
     meet_eligible,
     plan_trip_elligible,
     current_nb_participants,
     max_number_participant,
     is_full,
-    vector_preference_event -- JSON ou ARRAY (16 dims)
+    vector_preference_event
 FROM profil_event_for_es_sync;
 """
 
-# =====================================================================
-# Helpers Python
-# =====================================================================
-
 def _convert_pg_value(val: Any) -> Any:
-    """
-    Petits helpers pour gérer les colonnes JSON / ARRAY renvoyées par Postgres.
-    Si c'est une string qui ressemble à du JSON -> json.loads.
-    Sinon on renvoie tel quel.
-    """
     if isinstance(val, str):
         val_strip = val.strip()
         if (val_strip.startswith("[") and val_strip.endswith("]")) or \
@@ -105,15 +80,10 @@ def _convert_pg_value(val: Any) -> Any:
             try:
                 return json.loads(val_strip)
             except Exception:
-                return val  # on laisse en l'état si parse impossible
+                return val
     return val
 
-
 def build_winkers_payload(rows: List[tuple]) -> List[Dict[str, Any]]:
-    """
-    Transforme les lignes SQL (tuples) en liste de dictionnaires
-    conformes au schéma WinkerIn de ton service FastAPI.
-    """
     payload = []
     for row in rows:
         (
@@ -155,11 +125,9 @@ def build_winkers_payload(rows: List[tuple]) -> List[Dict[str, Any]]:
         )
     return payload
 
-
 def build_events_payload(rows: List[tuple]) -> List[Dict[str, Any]]:
     """
-    Transforme les lignes SQL (tuples) en liste de dictionnaires
-    conformes au schéma EventIn de ton service FastAPI.
+    ✅ Ajout de event_id (keyword) : on le met en string pour être safe.
     """
     payload = []
     for row in rows:
@@ -192,7 +160,12 @@ def build_events_payload(rows: List[tuple]) -> List[Dict[str, Any]]:
 
         payload.append(
             {
+                # ancien champ si ton API FastAPI l’attend
                 "id": id_,
+
+                # ✅ nouveau champ ES (mapping keyword)
+                "event_id": str(id_) if id_ is not None else None,
+
                 "titre": titre,
                 "bioEvent": bio_event,
                 "city": city,
@@ -220,18 +193,11 @@ def build_events_payload(rows: List[tuple]) -> List[Dict[str, Any]]:
         )
     return payload
 
-
 def push_winkers_to_es(ti, **_):
-    """
-    Récupère les lignes retournées par le PostgresOperator (XCom),
-    les transforme en JSON, puis les envoie au service FastAPI
-    sur /api/v1/index/winkers/bulk.
-    """
     rows = ti.xcom_pull(task_ids="fetch_winkers_task") or []
     logging.info(f"[WINKERS] {len(rows)} rows fetched from Postgres")
 
     payload = build_winkers_payload(rows)
-
     if not payload:
         logging.info("[WINKERS] Nothing to send to ES")
         return
@@ -241,19 +207,13 @@ def push_winkers_to_es(ti, **_):
 
     resp = requests.post(url, json=payload, timeout=60)
     resp.raise_for_status()
-
     logging.info(f"[WINKERS] ES index response: {resp.status_code} - {resp.text}")
 
-
 def push_events_to_es(ti, **_):
-    """
-    Idem pour les events.
-    """
     rows = ti.xcom_pull(task_ids="fetch_events_task") or []
     logging.info(f"[EVENTS] {len(rows)} rows fetched from Postgres")
 
     payload = build_events_payload(rows)
-
     if not payload:
         logging.info("[EVENTS] Nothing to send to ES")
         return
@@ -263,13 +223,7 @@ def push_events_to_es(ti, **_):
 
     resp = requests.post(url, json=payload, timeout=60)
     resp.raise_for_status()
-
     logging.info(f"[EVENTS] ES index response: {resp.status_code} - {resp.text}")
-
-
-# =====================================================================
-# Définition du DAG
-# =====================================================================
 
 with DAG(
     dag_id=DAG_ID,
@@ -280,21 +234,18 @@ with DAG(
 ) as dag:
     dag.timezone = PARIS_TZ
 
-    # 1) Récupérer les winkers à indexer
     fetch_winkers_task = PostgresOperator(
         task_id="fetch_winkers_task",
         postgres_conn_id=POSTGRES_CONN_ID,
         sql=SQL_SELECT_WINKERS_FOR_ES,
-        do_xcom_push=True,  # on récupère les résultats dans XCom
+        do_xcom_push=True,
     )
 
-    # 2) Pousser les winkers dans ES via FastAPI
     push_winkers_task = PythonOperator(
         task_id="push_winkers_to_es",
         python_callable=push_winkers_to_es,
     )
 
-    # 3) Récupérer les events à indexer
     fetch_events_task = PostgresOperator(
         task_id="fetch_events_task",
         postgres_conn_id=POSTGRES_CONN_ID,
@@ -302,12 +253,10 @@ with DAG(
         do_xcom_push=True,
     )
 
-    # 4) Pousser les events dans ES via FastAPI
     push_events_task = PythonOperator(
         task_id="push_events_to_es",
         python_callable=push_events_to_es,
     )
 
-    # Ordonnancement : on fait tout, mais winkers et events peuvent être parallèles
     fetch_winkers_task >> push_winkers_task
     fetch_events_task >> push_events_task
