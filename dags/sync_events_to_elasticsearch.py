@@ -19,9 +19,11 @@ from elasticsearch import Elasticsearch, helpers
 PARIS_TZ = ZoneInfo("Europe/Paris")
 
 DAG_ID = "sync_events_to_elasticsearch"
+# ✅ index dédié reco pour NE PAS écraser l’index canonique "nisu_events"
 INDEX_NAME = "nisu_events"
 
-EMBEDDINGS_URL = "https://recommendation.nisu.fr/api/v1/recommendations/embeddings"
+# endpoint embeddings (si 404 -> on continue sans embeddings)
+EMBEDDINGS_URL = "https://recommendation.nisu.fr/api/v1/recommendations/embedding"
 EMBEDDINGS_TIMEOUT = 60
 EMBEDDING_DIMS = 768
 
@@ -35,7 +37,9 @@ SELECT
   id,
   "creatorWinker_id" AS winker_id,
   titre,
+  titre_fr,
   "bioEvent" AS bio,
+  "bioEvent_fr" AS bio_fr,
   "hastagEvents" AS preferences,
   0 AS boost,
   lat,
@@ -61,13 +65,14 @@ def get_es_client() -> Elasticsearch:
 
 def _parse_preferences(value: Any) -> List[str]:
     """
-    hastagEvents chez toi est un TextField -> parfois string, parfois JSON, parfois 'a,b,c'
+    hastagEvents: parfois string, parfois JSON, parfois CSV.
+    On normalise en list[str].
     """
     if value is None:
         return []
 
     if isinstance(value, (list, tuple, set)):
-        return [str(x).strip() for x in value if str(x).strip()]
+        return [str(x).strip().lstrip("#") for x in value if str(x).strip()]
 
     if isinstance(value, str):
         s = value.strip()
@@ -79,11 +84,11 @@ def _parse_preferences(value: Any) -> List[str]:
             try:
                 data = json.loads(s)
                 if isinstance(data, list):
-                    return [str(x).strip() for x in data if str(x).strip()]
+                    return [str(x).strip().lstrip("#") for x in data if str(x).strip()]
             except Exception:
                 pass
 
-        # CSV
+        # CSV ?
         if "," in s:
             return [x.strip().lstrip("#") for x in s.split(",") if x.strip()]
 
@@ -92,27 +97,35 @@ def _parse_preferences(value: Any) -> List[str]:
             parts = [p.strip() for p in s.split(" ") if p.strip()]
             return [p.lstrip("#") for p in parts]
 
-        # string unique
         return [s.lstrip("#")]
 
-    return [str(value).strip()] if str(value).strip() else []
+    s = str(value).strip()
+    return [s.lstrip("#")] if s else []
 
 
 def _embedding(text: str) -> List[float]:
     if not text:
         return []
-    r = requests.post(
+
+    r = requests.get(
         EMBEDDINGS_URL,
-        json={"text": text},
+        params={"text": text},
         timeout=EMBEDDINGS_TIMEOUT,
+        headers={"accept": "application/json"},
     )
     r.raise_for_status()
+
     data = r.json()
     vec = data.get("embedding") or []
     if not isinstance(vec, list):
         return []
+
     if len(vec) != EMBEDDING_DIMS:
-        logging.warning("Embedding dims mismatch: got=%s expected=%s", len(vec), EMBEDDING_DIMS)
+        logging.warning(
+            "Embedding dims mismatch: got=%s expected=%s",
+            len(vec),
+            EMBEDDING_DIMS,
+        )
     return vec
 
 
@@ -121,8 +134,14 @@ def index_events_to_es(ti, **_):
     if not rows:
         logging.info("Aucun event à indexer.")
         return
+    logging.info("Nombre total de rows récupérées: %d", len(rows))
 
     col_names = ["id", "winker_id", "titre", "bio", "preferences", "boost", "lat", "lon"]
+
+    first_row = rows[0]
+    logging.info("Première row (nb colonnes=%d): %s", len(first_row), first_row)
+
+
     es = get_es_client()
 
     actions = []
@@ -133,7 +152,9 @@ def index_events_to_es(ti, **_):
         event_id = rec["id"]
         winker_id = rec.get("winker_id")
         titre = rec.get("titre") or ""
+        titre_fr = rec.get("titre_fr") or ""
         bio = rec.get("bio") or ""
+        bio_fr = rec.get("bio_fr") or ""
         preferences = _parse_preferences(rec.get("preferences"))
         boost = rec.get("boost") or 0
 
@@ -149,23 +170,28 @@ def index_events_to_es(ti, **_):
         preferences_text = ", ".join(preferences) if preferences else ""
         merged_text = " ".join([x for x in [titre, bio, preferences_text] if x]).strip()
 
-        # 👉 on remplit UNIQUEMENT le vecteur global (plus rapide et c'est ton objectif)
-        try:
-            merged_vec = _embedding(merged_text) if merged_text else []
-        except Exception as e:
-            logging.exception("Erreur embedding event_id=%s: %s", event_id, e)
-            merged_vec = []
+        merged_vec: List[float] = []
+        if merged_text:
+            try:
+                merged_vec = _embedding(merged_text)
+            except Exception as e:
+                logging.exception("Erreur embedding event_id=%s: %s", event_id, e)
+                merged_vec = []
 
         doc: Dict[str, Any] = {
+            "event_id": str(event_id),
             "winkerId": str(winker_id) if winker_id is not None else None,
             "boost": int(boost),
             "titre": titre,
+            "titre_fr": titre_fr,
             "bio": bio,
+            "bio_fr": bio_fr,
             "preferences": preferences,
         }
 
         if localisation:
             doc["localisation"] = localisation
+
         if merged_vec:
             doc["embedding_vector"] = merged_vec
 
@@ -173,13 +199,13 @@ def index_events_to_es(ti, **_):
             {
                 "_op_type": "index",
                 "_index": INDEX_NAME,
-                "_id": event_id,
+                "_id": str(event_id),
                 "_source": doc,
             }
         )
 
     helpers.bulk(es, actions)
-    logging.info("Indexation terminée: %d docs", len(actions))
+    logging.info("Indexation terminée: %d docs -> index=%s", len(actions), INDEX_NAME)
 
 
 with DAG(
@@ -187,7 +213,7 @@ with DAG(
     default_args=default_args,
     schedule_interval="@daily",
     catchup=False,
-    tags=["events", "elasticsearch"],
+    tags=["events", "elasticsearch", "reco"],
 ) as dag:
     dag.timezone = PARIS_TZ
 
