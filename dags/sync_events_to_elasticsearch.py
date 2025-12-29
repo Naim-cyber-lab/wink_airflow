@@ -4,7 +4,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import logging
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -19,10 +19,9 @@ from elasticsearch import Elasticsearch, helpers
 PARIS_TZ = ZoneInfo("Europe/Paris")
 
 DAG_ID = "sync_events_to_elasticsearch"
-# ✅ index dédié reco pour NE PAS écraser l’index canonique "nisu_events"
 INDEX_NAME = "nisu_events"
 
-# endpoint embeddings (si 404 -> on continue sans embeddings)
+# Endpoint embeddings (Swagger route GET /embedding?text=...)
 EMBEDDINGS_URL = "https://recommendation.nisu.fr/api/v1/recommendations/embedding"
 EMBEDDINGS_TIMEOUT = 60
 EMBEDDING_DIMS = 768
@@ -47,6 +46,20 @@ SELECT
 FROM profil_event;
 """
 
+# Doit matcher l'ordre exact du SELECT ci-dessus (10 colonnes)
+COL_NAMES = [
+    "id",
+    "winker_id",
+    "titre",
+    "titre_fr",
+    "bio",
+    "bio_fr",
+    "preferences",
+    "boost",
+    "lat",
+    "lon",
+]
+
 
 def get_es_client() -> Elasticsearch:
     conn = BaseHook.get_connection("elasticsearch_default")
@@ -66,7 +79,7 @@ def get_es_client() -> Elasticsearch:
 def _parse_preferences(value: Any) -> List[str]:
     """
     hastagEvents: parfois string, parfois JSON, parfois CSV.
-    On normalise en list[str].
+    On normalise en list[str] sans "#".
     """
     if value is None:
         return []
@@ -104,6 +117,11 @@ def _parse_preferences(value: Any) -> List[str]:
 
 
 def _embedding(text: str) -> List[float]:
+    """
+    Appelle le service FastAPI exposé dans Swagger:
+    GET /embedding?text=...
+    Retour attendu: { "dims": 768, "embedding": [...], "normalized": true }
+    """
     if not text:
         return []
 
@@ -115,7 +133,7 @@ def _embedding(text: str) -> List[float]:
     )
     r.raise_for_status()
 
-    data = r.json()
+    data = r.json() or {}
     vec = data.get("embedding") or []
     if not isinstance(vec, list):
         return []
@@ -126,7 +144,24 @@ def _embedding(text: str) -> List[float]:
             len(vec),
             EMBEDDING_DIMS,
         )
+
     return vec
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _build_localisation(lat: Any, lon: Any) -> Optional[Dict[str, float]]:
+    if lat is None or lon is None:
+        return None
+    try:
+        return {"lat": float(lat), "lon": float(lon)}
+    except Exception:
+        return None
 
 
 def index_events_to_es(ti, **_):
@@ -134,41 +169,46 @@ def index_events_to_es(ti, **_):
     if not rows:
         logging.info("Aucun event à indexer.")
         return
-    logging.info("Nombre total de rows récupérées: %d", len(rows))
 
-    col_names = ["id", "winker_id", "titre", "bio", "preferences", "boost", "lat", "lon"]
+    logging.info("Nombre total de rows récupérées: %d", len(rows))
 
     first_row = rows[0]
     logging.info("Première row (nb colonnes=%d): %s", len(first_row), first_row)
 
+    # petit check d'alignement (debug)
+    if len(first_row) != len(COL_NAMES):
+        logging.warning(
+            "Mismatch colonnes: SELECT renvoie %d colonnes mais COL_NAMES en contient %d",
+            len(first_row),
+            len(COL_NAMES),
+        )
 
     es = get_es_client()
-
-    actions = []
+    actions: List[Dict[str, Any]] = []
 
     for row in rows:
-        rec = {col_names[i]: row[i] for i in range(len(col_names))}
+        # mapping safe: s'arrête au min des deux longueurs
+        m = min(len(COL_NAMES), len(row))
+        rec = {COL_NAMES[i]: row[i] for i in range(m)}
 
-        event_id = rec["id"]
+        event_id = rec.get("id")
         winker_id = rec.get("winker_id")
-        titre = rec.get("titre") or ""
-        titre_fr = rec.get("titre_fr") or ""
-        bio = rec.get("bio") or ""
-        bio_fr = rec.get("bio_fr") or ""
+
+        titre = (rec.get("titre") or "").strip()
+        titre_fr = (rec.get("titre_fr") or "").strip()
+        bio = (rec.get("bio") or "").strip()
+        bio_fr = (rec.get("bio_fr") or "").strip()
+
         preferences = _parse_preferences(rec.get("preferences"))
-        boost = rec.get("boost") or 0
+        boost = _safe_int(rec.get("boost"), default=0)
 
-        lat = rec.get("lat")
-        lon = rec.get("lon")
-        localisation = None
-        if lat is not None and lon is not None:
-            try:
-                localisation = {"lat": float(lat), "lon": float(lon)}
-            except Exception:
-                localisation = None
+        localisation = _build_localisation(rec.get("lat"), rec.get("lon"))
 
+        # embeddings: priorité FR si dispo, sinon fallback EN
         preferences_text = ", ".join(preferences) if preferences else ""
-        merged_text = " ".join([x for x in [titre, bio, preferences_text] if x]).strip()
+        merged_text = " ".join(
+            [x for x in [titre_fr or titre, bio_fr or bio, preferences_text] if x]
+        ).strip()
 
         merged_vec: List[float] = []
         if merged_text:
@@ -179,9 +219,9 @@ def index_events_to_es(ti, **_):
                 merged_vec = []
 
         doc: Dict[str, Any] = {
-            "event_id": str(event_id),
+            "event_id": str(event_id) if event_id is not None else None,
             "winkerId": str(winker_id) if winker_id is not None else None,
-            "boost": int(boost),
+            "boost": boost,
             "titre": titre,
             "titre_fr": titre_fr,
             "bio": bio,
@@ -195,6 +235,7 @@ def index_events_to_es(ti, **_):
         if merged_vec:
             doc["embedding_vector"] = merged_vec
 
+        # _id ES = id event (upsert)
         actions.append(
             {
                 "_op_type": "index",
