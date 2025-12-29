@@ -23,7 +23,7 @@ DAG_ID = "sync_events_to_elasticsearch"
 INDEX_NAME = "nisu_events"
 
 # endpoint embeddings (si 404 -> on continue sans embeddings)
-EMBEDDINGS_URL = "https://recommendation.nisu.fr/api/v1/recommendations/embeddings"
+EMBEDDINGS_URL = "https://recommendation.nisu.fr/api/v1/recommendations/embedding"
 EMBEDDINGS_TIMEOUT = 60
 EMBEDDING_DIMS = 768
 
@@ -107,10 +107,11 @@ def _embedding(text: str) -> List[float]:
     if not text:
         return []
 
-    r = requests.post(
+    r = requests.get(
         EMBEDDINGS_URL,
-        json={"text": text},
+        params={"text": text},
         timeout=EMBEDDINGS_TIMEOUT,
+        headers={"accept": "application/json"},
     )
     r.raise_for_status()
 
@@ -120,8 +121,11 @@ def _embedding(text: str) -> List[float]:
         return []
 
     if len(vec) != EMBEDDING_DIMS:
-        logging.warning("Embedding dims mismatch: got=%s expected=%s", len(vec), EMBEDDING_DIMS)
-
+        logging.warning(
+            "Embedding dims mismatch: got=%s expected=%s",
+            len(vec),
+            EMBEDDING_DIMS,
+        )
     return vec
 
 
