@@ -20,7 +20,7 @@ PARIS_TZ = ZoneInfo("Europe/Paris")
 
 DAG_ID = "sync_events_to_elasticsearch"
 # ✅ index dédié reco pour NE PAS écraser l’index canonique "nisu_events"
-INDEX_NAME = "nisu_events_reco"
+INDEX_NAME = "nisu_events"
 
 # endpoint embeddings (si 404 -> on continue sans embeddings)
 EMBEDDINGS_URL = "https://recommendation.nisu.fr/api/v1/recommendations/embeddings"
@@ -37,7 +37,9 @@ SELECT
   id,
   "creatorWinker_id" AS winker_id,
   titre,
+  titre_fr,
   "bioEvent" AS bio,
+  "bioEvent_fr" AS bio_fr,
   "hastagEvents" AS preferences,
   0 AS boost,
   lat,
@@ -128,8 +130,14 @@ def index_events_to_es(ti, **_):
     if not rows:
         logging.info("Aucun event à indexer.")
         return
+    logging.info("Nombre total de rows récupérées: %d", len(rows))
 
     col_names = ["id", "winker_id", "titre", "bio", "preferences", "boost", "lat", "lon"]
+
+    first_row = rows[0]
+    logging.info("Première row (nb colonnes=%d): %s", len(first_row), first_row)
+
+
     es = get_es_client()
 
     actions = []
@@ -137,10 +145,12 @@ def index_events_to_es(ti, **_):
     for row in rows:
         rec = {col_names[i]: row[i] for i in range(len(col_names))}
 
-        event_id = rec["id"]  # ✅ id profil_event
+        event_id = rec["id"]
         winker_id = rec.get("winker_id")
         titre = rec.get("titre") or ""
+        titre_fr = rec.get("titre_fr") or ""
         bio = rec.get("bio") or ""
+        bio_fr = rec.get("bio_fr") or ""
         preferences = _parse_preferences(rec.get("preferences"))
         boost = rec.get("boost") or 0
 
@@ -156,7 +166,6 @@ def index_events_to_es(ti, **_):
         preferences_text = ", ".join(preferences) if preferences else ""
         merged_text = " ".join([x for x in [titre, bio, preferences_text] if x]).strip()
 
-        # ✅ embeddings : si 404 / erreur -> on ne casse pas l’indexation
         merged_vec: List[float] = []
         if merged_text:
             try:
@@ -165,13 +174,14 @@ def index_events_to_es(ti, **_):
                 logging.exception("Erreur embedding event_id=%s: %s", event_id, e)
                 merged_vec = []
 
-        # ✅ doc RECO (dans index dédié)
         doc: Dict[str, Any] = {
-            "event_id": str(event_id),  # ✅ champ existant, requêtable via exists
+            "event_id": str(event_id),
             "winkerId": str(winker_id) if winker_id is not None else None,
             "boost": int(boost),
             "titre": titre,
+            "titre_fr": titre_fr,
             "bio": bio,
+            "bio_fr": bio_fr,
             "preferences": preferences,
         }
 
@@ -185,7 +195,7 @@ def index_events_to_es(ti, **_):
             {
                 "_op_type": "index",
                 "_index": INDEX_NAME,
-                "_id": str(event_id),  # ✅ ES _id = id profil_event
+                "_id": str(event_id),
                 "_source": doc,
             }
         )
