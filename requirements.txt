@@ -4,3 +4,6 @@ yt_dlp
 requests
 mailjet-rest
 apache-airflow-providers-postgres
+playwright
+geopy
+pandas
