@@ -151,10 +151,11 @@ def upsert_events_from_csv(**context):
     address_col = params["address_col"]
     website_col = params.get("website_col", "MRe4xd href")  # dans tes excels
     region_default = params.get("region_default", "Paris")
-    creator_winker_id = int(params.get("creator_winker_id", 116))
+    creator_winker_id = 116
     active_default = int(params.get("active_default", 0))
     max_participants = int(params.get("max_participants", 99999999))
     access_comment = bool(params.get("access_comment", True))
+    validated_from_web = False
 
     ti = context["ti"]
     csv_path = ti.xcom_pull(task_ids="enrich_and_export_csv", key="enriched_csv_path")
@@ -243,9 +244,9 @@ def upsert_events_from_csv(**context):
                 INSERT INTO profil_event (
                     titre, adresse, region, city, "codePostal",
                     "bioEvent", website, "creatorWinker_id",
-                    active, lat, lon, "maxNumberParticipant", "accessComment"
+                    active, lat, lon, "maxNumberParticipant", "accessComment", validated_from_web
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
                 (
@@ -262,6 +263,7 @@ def upsert_events_from_csv(**context):
                     lon,
                     max_participants,
                     access_comment,
+                    validated_from_web,
                 ),
             )
             _new_id = cursor.fetchone()[0]
