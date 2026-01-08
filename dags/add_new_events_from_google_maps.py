@@ -307,7 +307,7 @@ with DAG(
         provide_context=True,
         params={
             # 🔧 À ADAPTER
-            "root_folder": "/opt/airflow/data/maps",   # dossier contenant les sous-dossiers avec google*.xlsx
+            "root_folder": "/opt/airflow/data",   # dossier contenant les sous-dossiers avec google*.xlsx
             "name_col": "OSrXXb",
             "address_col": "rllt__details 3",
             "website_col": "MRe4xd href",
