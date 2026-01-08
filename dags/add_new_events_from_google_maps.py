@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import re
@@ -16,9 +17,7 @@ from airflow.hooks.base import BaseHook
 from airflow.operators.python import PythonOperator
 from airflow.utils.dates import days_ago
 
-# ✅ On importe ton pipeline existant
-# Assure-toi que social_enricher.py est importable depuis Airflow
-from social_enricher import run_pipeline  # type: ignore
+import social_enricher  # type: ignore
 
 
 PARIS_TZ = ZoneInfo("Europe/Paris")
@@ -34,13 +33,9 @@ DAG_DOC = r"""
   - `tiktok_video`
 - Insérer / mettre à jour `profil_event` (Event Django) en évitant les doublons.
 
-**Déduplication DB**
-- On considère qu’un event existe déjà si `titre` + `adresse` matchent.
-- Si existant : on met à jour `bioEvent` / `website` / coords si manquantes.
-
-**Remarques**
-- Les URLs YouTube/TikTok sont stockées dans `bioEvent` (append).
-- Pour TikTok, si tu utilises un `tt_state.json`, assure-toi qu’il est présent sur le worker Airflow.
+**Mode debug**
+- Param `debug_limit_rows`: si défini (ex: 5), on limite le DF à N lignes **avant** YouTube/TikTok.
+  -> Pour revenir au normal, mets `debug_limit_rows: None` (ou commente la ligne).
 """
 
 
@@ -48,6 +43,7 @@ DAG_DOC = r"""
 # Helpers
 # -----------------------------------------------------------------------------
 POSTAL_RE = re.compile(r"\b(\d{5})\b")
+
 
 def safe_str(x) -> str:
     if x is None:
@@ -59,14 +55,15 @@ def safe_str(x) -> str:
         pass
     return str(x).strip()
 
+
 def extract_postal_code(address: str) -> str | None:
     if not address:
         return None
     m = POSTAL_RE.search(address)
     return m.group(1) if m else None
 
+
 def guess_city(address: str) -> str | None:
-    # Heuristique rapide : si ça contient "paris"
     if not address:
         return None
     a = address.lower()
@@ -74,11 +71,11 @@ def guess_city(address: str) -> str | None:
         return "Paris"
     return None
 
+
 def build_bio_event(base_bio: str, youtube: str | None, tiktok: str | None) -> str:
     base_bio = safe_str(base_bio)
     lines = [base_bio] if base_bio else []
 
-    # append social links (sans doublonner)
     if youtube:
         yt_line = f"YouTube Shorts: {youtube}"
         if yt_line not in base_bio:
@@ -91,30 +88,117 @@ def build_bio_event(base_bio: str, youtube: str | None, tiktok: str | None) -> s
     return "\n".join([l for l in lines if l]).strip()
 
 
+def _call_with_supported_kwargs(func, **kwargs):
+    """
+    Appelle une fonction en filtrant les kwargs qui ne sont pas dans la signature.
+    Ça rend le DAG plus robuste si social_enricher évolue.
+    """
+    sig = inspect.signature(func)
+    accepted = {k: v for k, v in kwargs.items() if k in sig.parameters and v is not None}
+    return func(**accepted)
+
+
 # -----------------------------------------------------------------------------
-# Task 1: Enrich + write CSV
+# Task 1: Enrich + write CSV (avec limite AVANT Playwright)
 # -----------------------------------------------------------------------------
+async def _run_pipeline_limited(
+    root_folder: str,
+    name_col: str,
+    address_col: str,
+    do_geocode: bool,
+    geocode_cache: str | None,
+    tt_state_path: str | None,
+    headless: bool,
+    debug_limit_rows: int | None,
+    skip_tiktok_if_no_state: bool,
+):
+    """
+    Pipeline reconstruit à partir des fonctions de social_enricher, pour pouvoir faire:
+    load -> dedup -> head(N) -> enrich youtube/tiktok
+    """
+
+    # 1) Load excels
+    load_all = getattr(social_enricher, "load_all_google_excels", None)
+    if load_all is None:
+        raise ImportError("social_enricher.load_all_google_excels introuvable")
+
+    df = _call_with_supported_kwargs(load_all, root_folder=root_folder)
+
+    # 2) Debug: limiter AVANT enrichment social
+    if debug_limit_rows is not None:
+        df = df.head(int(debug_limit_rows)).copy()
+        logging.warning(f"🧪 [debug] Limitation DataFrame à {len(df)} lignes (debug_limit_rows={debug_limit_rows})")
+
+    # 3) YouTube
+    add_yt = getattr(social_enricher, "add_youtube_shorts_to_df", None)
+    if add_yt is None:
+        logging.warning("⚠️ add_youtube_shorts_to_df introuvable, skip YouTube")
+    else:
+        df = await _call_with_supported_kwargs(
+            add_yt,
+            df=df,
+            name_col=name_col,
+            address_col=address_col,
+            headless=headless,
+        )
+
+    # 4) TikTok
+    add_tt = getattr(social_enricher, "add_tiktok_videos_to_df", None)
+    if add_tt is None:
+        logging.warning("⚠️ add_tiktok_videos_to_df introuvable, skip TikTok")
+        return df
+
+    # Si le fichier n'existe pas, ça plante (tu l'as vu). En debug on peut skip.
+    if tt_state_path and not os.path.exists(tt_state_path):
+        msg = f"⚠️ tt_state.json introuvable: {tt_state_path}"
+        if skip_tiktok_if_no_state:
+            logging.warning(msg + " -> skip TikTok (skip_tiktok_if_no_state=True)")
+            return df
+        logging.warning(msg + " -> on tente TikTok sans storage state (tt_state_path=None)")
+        tt_state_path = None
+
+    df = await _call_with_supported_kwargs(
+        add_tt,
+        df=df,
+        name_col=name_col,
+        address_col=address_col,
+        tt_state_path=tt_state_path,
+        headless=headless,
+    )
+
+    return df
+
+
 def enrich_and_export_csv(**context):
     """
-    Lance ton pipeline (playwright) puis exporte un CSV sur disque.
+    Lance le pipeline (playwright) puis exporte un CSV sur disque.
     """
     params = context["params"]
 
     root_folder = params["root_folder"]
     name_col = params["name_col"]
     address_col = params["address_col"]
-    headless = params.get("headless", False)
-    tt_state_path = params.get("tt_state_path", "tt_state.json")
-    do_geocode = params.get("do_geocode", False)
-    geocode_cache = params.get("geocode_cache", "geocode_cache.csv")
+
+    headless = bool(params.get("headless", True))
+    tt_state_path = params.get("tt_state_path")
+    do_geocode = bool(params.get("do_geocode", False))
+    geocode_cache = params.get("geocode_cache")
+
+    # 🧪 DEBUG: limite AVANT YouTube/TikTok
+    debug_limit_rows = params.get("debug_limit_rows", 5)  # <-- mets None pour revenir au normal
+    # debug_limit_rows = None  # <-- (alternative) décommente ça pour revenir au normal
+
+    # si tt_state.json absent: on peut skip TikTok en debug
+    skip_tiktok_if_no_state = bool(params.get("skip_tiktok_if_no_state", True))
 
     output_dir = params.get("output_dir", "/opt/airflow/data")
     os.makedirs(output_dir, exist_ok=True)
     out_csv = os.path.join(output_dir, "events_enriched.csv")
 
     logging.info("🚀 [enrich] Starting pipeline...")
+
     df = asyncio.run(
-        run_pipeline(
+        _run_pipeline_limited(
             root_folder=root_folder,
             name_col=name_col,
             address_col=address_col,
@@ -122,6 +206,8 @@ def enrich_and_export_csv(**context):
             geocode_cache=geocode_cache,
             tt_state_path=tt_state_path,
             headless=headless,
+            debug_limit_rows=debug_limit_rows,
+            skip_tiktok_if_no_state=skip_tiktok_if_no_state,
         )
     )
 
@@ -149,9 +235,9 @@ def upsert_events_from_csv(**context):
     params = context["params"]
     name_col = params["name_col"]
     address_col = params["address_col"]
-    website_col = params.get("website_col", "MRe4xd href")  # dans tes excels
+    website_col = params.get("website_col", "MRe4xd href")
     region_default = params.get("region_default", "Paris")
-    creator_winker_id = 116
+    creator_winker_id = int(params.get("creator_winker_id", 116))
     active_default = int(params.get("active_default", 0))
     max_participants = int(params.get("max_participants", 99999999))
     access_comment = bool(params.get("access_comment", True))
@@ -198,10 +284,8 @@ def upsert_events_from_csv(**context):
             lat = row.get("latitude", None)
             lon = row.get("longitude", None)
 
-            # Bio: on met au minimum les liens sociaux
             bio_event = build_bio_event("", youtube=youtube, tiktok=tiktok)
 
-            # 1) Check existence (titre+adresse)
             cursor.execute(
                 """
                 SELECT id, "bioEvent", website, lat, lon
@@ -215,10 +299,8 @@ def upsert_events_from_csv(**context):
 
             if existing:
                 event_id, old_bio, old_website, old_lat, old_lon = existing
-
                 new_bio = build_bio_event(old_bio or "", youtube=youtube, tiktok=tiktok)
 
-                # On met à jour seulement ce qui apporte de la valeur
                 final_website = old_website or website
                 final_lat = old_lat if old_lat is not None else lat
                 final_lon = old_lon if old_lon is not None else lon
@@ -238,7 +320,6 @@ def upsert_events_from_csv(**context):
                 updated += 1
                 continue
 
-            # 2) Insert new event (reprend les colonnes vues dans tes DAGs)
             cursor.execute(
                 """
                 INSERT INTO profil_event (
@@ -266,7 +347,7 @@ def upsert_events_from_csv(**context):
                     validated_from_web,
                 ),
             )
-            _new_id = cursor.fetchone()[0]
+            cursor.fetchone()
             inserted += 1
 
         connection.commit()
@@ -293,7 +374,7 @@ default_args = {
 with DAG(
     dag_id="import_events_from_google_excels_social_enricher",
     start_date=days_ago(1),
-    schedule_interval="0 3 * * *",  # tous les jours à 03:00
+    schedule_interval="0 3 * * *",
     catchup=False,
     default_args=default_args,
     tags=["event", "import", "tiktok", "youtube", "playwright"],
@@ -306,17 +387,20 @@ with DAG(
         python_callable=enrich_and_export_csv,
         provide_context=True,
         params={
-            # 🔧 À ADAPTER
-            "root_folder": "/opt/airflow/data",   # dossier contenant les sous-dossiers avec google*.xlsx
+            "root_folder": "/opt/airflow/data",
             "name_col": "OSrXXb",
             "address_col": "rllt__details 3",
             "website_col": "MRe4xd href",
 
             # Playwright
-            "headless": True,                         # pour debug, passe à True si ok
+            "headless": True,
             "tt_state_path": "/opt/airflow/data/tt_state.json",
 
-            # Geocode optionnel (si geopy + cache)
+            # 🧪 DEBUG (facile à enlever)
+            "debug_limit_rows": 5,           # <-- mets None ou commente cette ligne pour full dataframe
+            "skip_tiktok_if_no_state": True, # <-- évite le crash si tt_state.json absent
+
+            # Geocode optionnel
             "do_geocode": False,
             "geocode_cache": "/opt/airflow/data/geocode_cache.csv",
 
@@ -334,7 +418,6 @@ with DAG(
             "address_col": "rllt__details 3",
             "website_col": "MRe4xd href",
 
-            # Defaults DB
             "region_default": "Paris",
             "creator_winker_id": 116,
             "active_default": 0,
