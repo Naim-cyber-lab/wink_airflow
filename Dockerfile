@@ -33,6 +33,9 @@ RUN apt-get update && \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+# ✅ 1bis) Dossier data writable par l'utilisateur airflow
+RUN mkdir -p /opt/airflow/data && chown -R airflow: /opt/airflow/data
+
 # 2) Dépendances Python
 COPY requirements.txt /requirements.txt
 
