@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-
-import pandas as pd
 from urllib.parse import quote_plus
 
+import pandas as pd
 from playwright.async_api import async_playwright
 
 # Optionnel (lat/lng)
@@ -70,7 +70,6 @@ def compute_row_id(row: pd.Series, key_cols: list[str]) -> str:
 def build_query(name, address, fallback=None) -> str:
     """
     Query = nom + adresse (et fallback si le nom est vide)
-    Exemple: "Tour Eiffel Champ de Mars, 5 Avenue Anatole France, 75007 Paris"
     """
     name = safe_str(name)
     address = safe_str(address)
@@ -128,9 +127,7 @@ def load_all_google_excels(
 
     df_all = pd.concat(all_dfs, ignore_index=True).dropna(how="all").reset_index(drop=True)
 
-    # mapping columns case-insensitive
     col_map = {c.lower().strip(): c for c in df_all.columns}
-
     existing_key_cols = []
     for k in dedupe_key_cols:
         k_low = k.lower().strip()
@@ -146,8 +143,8 @@ def load_all_google_excels(
     df_all = df_all.drop_duplicates(subset=["row_id"], keep="first").reset_index(drop=True)
     after = len(df_all)
 
-    print(f"[load] Déduplication: {before} -> {after} lignes (supprimé {before-after})")
-    print(f"[load] Clés utilisées pour row_id: {existing_key_cols}")
+    logging.info(f"[load] Déduplication: {before} -> {after} lignes (supprimé {before-after})")
+    logging.info(f"[load] Clés utilisées pour row_id: {existing_key_cols}")
 
     return df_all
 
@@ -157,9 +154,6 @@ def load_all_google_excels(
 # ============================================================
 
 def choose_address_col(df: pd.DataFrame) -> str:
-    """
-    Heuristique simple pour choisir une colonne adresse.
-    """
     patterns = [
         r"\brue\b", r"\bbd\b", r"\bboulevard\b", r"\bavenue\b", r"\bav\b",
         r"\bplace\b", r"\bquai\b", r"\ballée\b", r"\bimpasse\b",
@@ -193,9 +187,6 @@ def add_lat_lng(
     min_delay_seconds: float = 1.1,
     timeout_seconds: int = 10,
 ) -> pd.DataFrame:
-    """
-    Ajoute latitude/longitude à partir de l'adresse (Nominatim) + cache CSV.
-    """
     if Nominatim is None or RateLimiter is None:
         raise ImportError("geopy n'est pas installé. pip install geopy")
 
@@ -203,7 +194,7 @@ def add_lat_lng(
 
     if address_col is None:
         address_col = choose_address_col(df)
-    print("[geo] Colonne adresse utilisée:", address_col)
+    logging.info("[geo] Colonne adresse utilisée: %s", address_col)
 
     addr = df[address_col].astype(str).fillna("").str.strip()
 
@@ -220,114 +211,92 @@ def add_lat_lng(
     df["_addr"] = addr.map(normalize)
 
     cache_file = Path(cache_path)
-    cache: dict[str, tuple[Optional[float], Optional[float]]] = {}
-
     if cache_file.exists():
-        old = pd.read_csv(cache_file)
-        for _, r in old.iterrows():
-            cache[str(r["address"])] = (r["latitude"], r["longitude"])
+        cache_df = pd.read_csv(cache_file)
+    else:
+        cache_df = pd.DataFrame(columns=["_addr", "latitude", "longitude"])
 
-    geolocator = Nominatim(user_agent="paris-activities-geocoder")
-    geocode = RateLimiter(
-        lambda q: geolocator.geocode(q, timeout=timeout_seconds),
-        min_delay_seconds=min_delay_seconds,
-        swallow_exceptions=True,
-    )
+    cache_map = {
+        r["_addr"]: (r["latitude"], r["longitude"])
+        for _, r in cache_df.dropna(subset=["_addr"]).iterrows()
+    }
 
-    unique_addrs = [a for a in df["_addr"].unique().tolist() if a]
+    geolocator = Nominatim(user_agent="wink-airflow-geocoder")
+    geocode = RateLimiter(geolocator.geocode, min_delay_seconds=min_delay_seconds)
+
+    lat_list = []
+    lon_list = []
     new_rows = []
 
-    for a in unique_addrs:
-        if a in cache:
+    for a in df["_addr"]:
+        if not a:
+            lat_list.append(None)
+            lon_list.append(None)
             continue
-        loc = geocode(a)
-        if loc:
-            cache[a] = (float(loc.latitude), float(loc.longitude))
-        else:
-            cache[a] = (None, None)
-        new_rows.append({"address": a, "latitude": cache[a][0], "longitude": cache[a][1]})
+
+        if a in cache_map:
+            lat, lon = cache_map[a]
+            lat_list.append(lat)
+            lon_list.append(lon)
+            continue
+
+        try:
+            loc = geocode(a, timeout=timeout_seconds)
+            if loc:
+                lat_list.append(loc.latitude)
+                lon_list.append(loc.longitude)
+                new_rows.append({"_addr": a, "latitude": loc.latitude, "longitude": loc.longitude})
+            else:
+                lat_list.append(None)
+                lon_list.append(None)
+                new_rows.append({"_addr": a, "latitude": None, "longitude": None})
+        except Exception:
+            lat_list.append(None)
+            lon_list.append(None)
+            new_rows.append({"_addr": a, "latitude": None, "longitude": None})
+
+    df["latitude"] = lat_list
+    df["longitude"] = lon_list
 
     if new_rows:
-        new_df = pd.DataFrame(new_rows)
-        if cache_file.exists():
-            merged = pd.concat([pd.read_csv(cache_file), new_df], ignore_index=True)
-            merged = merged.drop_duplicates(subset=["address"], keep="last")
-        else:
-            merged = new_df
-        merged.to_csv(cache_file, index=False)
+        cache_df = pd.concat([cache_df, pd.DataFrame(new_rows)], ignore_index=True)
+        cache_df = cache_df.drop_duplicates(subset=["_addr"], keep="last")
+        cache_df.to_csv(cache_file, index=False)
 
-    df["latitude"] = df["_addr"].map(lambda a: cache.get(a, (None, None))[0])
-    df["longitude"] = df["_addr"].map(lambda a: cache.get(a, (None, None))[1])
-    df.drop(columns=["_addr"], inplace=True)
-
-    found = df["latitude"].notna().sum()
-    print(f"[geo] Coords trouvées: {found} / {len(df)}")
-
+    df = df.drop(columns=["_addr"], errors="ignore")
     return df
 
 
 # ============================================================
-# 3) YouTube Shorts
+# 3) YouTube shorts
 # ============================================================
 
 @dataclass
 class Place:
-    query_text: str | None = None
-    name: str | None = None
-    address: str | None = None
+    name: str
+    address: str
     youtube_short_url: str | None = None
 
 
-async def _accept_consent_if_present(page):
-    candidates = [
-        'button:has-text("Tout accepter")',
-        'button:has-text("Accepter tout")',
-        'button:has-text("J’accepte")',
-        'button:has-text("J\'accepte")',
-        'button:has-text("Accept all")',
-        'button:has-text("I agree")',
-    ]
-    for sel in candidates:
-        try:
-            btn = page.locator(sel)
-            if await btn.count() > 0:
-                await btn.first.click()
-                await page.wait_for_timeout(800)
-                return
-        except Exception:
-            pass
-
-
 async def find_youtube_short(page, place: Place) -> Place:
-    query = build_query(place.name, place.address, place.query_text)
-    if not query:
-        return place
+    query = quote_plus(f"{place.name} {place.address} youtube shorts")
+    url = f"https://www.youtube.com/results?search_query={query}"
+    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-    url = f"https://www.youtube.com/results?search_query={quote_plus(query)}"
-    await page.goto(url, wait_until="domcontentloaded")
-    await _accept_consent_if_present(page)
+    await page.wait_for_timeout(1200)
 
-    try:
-        await page.wait_for_selector("ytd-search", timeout=10_000)
-    except Exception:
-        # debug screenshot
-        try:
-            await page.screenshot(path="yt_debug.png", full_page=True)
-        except Exception:
-            pass
-        return place
-
-    links = page.locator('a[href*="/shorts/"]')
-    for _ in range(8):
-        if await links.count() > 0:
-            href = await links.first.get_attribute("href")
-            if href:
+    anchors = await page.query_selector_all("a#video-title")
+    for a in anchors[:30]:
+        href = await a.get_attribute("href")
+        if not href:
+            continue
+        # shorts often contain /shorts/
+        if "/shorts/" in href:
+            if href.startswith("http"):
+                place.youtube_short_url = href
+            else:
                 place.youtube_short_url = f"https://www.youtube.com{href}"
             return place
-
-        await page.mouse.wheel(0, 2500)
-        await page.wait_for_timeout(1000)
-
     return place
 
 
@@ -335,7 +304,6 @@ async def add_youtube_shorts_to_df(
     df: pd.DataFrame,
     name_col: str,
     address_col: str,
-    fallback_col: str | None = None,
     headless: bool = True,
 ) -> pd.DataFrame:
     df = df.copy()
@@ -344,26 +312,20 @@ async def add_youtube_shorts_to_df(
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
-        context = await browser.new_context(locale="fr-FR", viewport={"width": 1280, "height": 800})
+        context = await browser.new_context()
         page = await context.new_page()
 
         for i, row in df.iterrows():
-            name = row.get(name_col)
-            address = row.get(address_col)
-            fallback = row.get(fallback_col) if fallback_col else None
-
-            query = build_query(name, address, fallback)
+            name = safe_str(row.get(name_col))
+            address = safe_str(row.get(address_col))
+            query = build_query(name, address, fallback=safe_str(row.get("category")))
             df.at[i, "youtube_query"] = query
-            if not query:
-                continue
 
-            place = Place(
-                name=safe_str(name) or None,
-                address=safe_str(address) or None,
-                query_text=safe_str(fallback) or None,
-            )
-            updated = await find_youtube_short(page, place)
-            df.at[i, "youtube_short"] = updated.youtube_short_url
+            try:
+                updated = await find_youtube_short(page, Place(name=name, address=address))
+                df.at[i, "youtube_short"] = updated.youtube_short_url
+            except Exception:
+                df.at[i, "youtube_short"] = None
 
         await context.close()
         await browser.close()
@@ -377,81 +339,43 @@ async def add_youtube_shorts_to_df(
 
 @dataclass
 class TikTokPlace:
-    query_text: Optional[str] = None
-    name: Optional[str] = None
-    address: Optional[str] = None
+    name: str
+    address: str
     tiktok_video_url: Optional[str] = None
 
 
 async def _dismiss_tiktok_popups(page) -> None:
-    candidates = [
-        'button:has-text("Accepter")',
-        'button:has-text("Tout accepter")',
-        'button:has-text("Accept all")',
-        'button:has-text("Accept")',
-        'button:has-text("Plus tard")',
-        'button:has-text("Not now")',
-        'button:has-text("Fermer")',
-        'button:has-text("Close")',
-    ]
-    for sel in candidates:
+    for _ in range(3):
         try:
-            btn = page.locator(sel)
-            if await btn.count() > 0:
-                await btn.first.click(timeout=1500)
-                await page.wait_for_timeout(400)
+            btn = await page.query_selector("button:has-text('Accept')")
+            if btn:
+                await btn.click()
         except Exception:
             pass
-
-
-async def save_tiktok_state(state_path: str = "tt_state.json") -> None:
-    """
-    Ouvre TikTok en headful, tu te connectes 1 fois,
-    puis sauvegarde cookies/session dans state_path.
-    """
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
-        context = await browser.new_context(locale="fr-FR", viewport={"width": 1280, "height": 800})
-        page = await context.new_page()
-
-        await page.goto("https://www.tiktok.com/", wait_until="domcontentloaded")
-        await _dismiss_tiktok_popups(page)
-
-        print("➡️ Connecte-toi manuellement si TikTok le demande.")
-        print("➡️ Quand tu peux naviguer sans blocage, reviens ici et appuie sur Entrée...")
-        input()
-
-        await context.storage_state(path=state_path)
-        print(f"✅ Session TikTok sauvegardée dans: {state_path}")
-
-        await context.close()
-        await browser.close()
+        await page.wait_for_timeout(200)
 
 
 async def find_tiktok_video(page, place: TikTokPlace, max_scrolls: int = 12) -> TikTokPlace:
-    query = build_query(place.name, place.address, place.query_text)
-    if not query:
-        return place
+    query = quote_plus(f"{place.name} {place.address} paris")
+    url = f"https://www.tiktok.com/search?q={query}"
+    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-    url = f"https://www.tiktok.com/search?q={quote_plus(query)}"
-    await page.goto(url, wait_until="domcontentloaded")
     await _dismiss_tiktok_popups(page)
-    await page.wait_for_timeout(1200)
-
-    video_links = page.locator('a[href*="/video/"]')
+    await page.wait_for_timeout(1000)
 
     for _ in range(max_scrolls):
         await _dismiss_tiktok_popups(page)
-
-        c = await video_links.count()
-        if c > 0:
-            href = await video_links.first.get_attribute("href")
-            if href:
+        anchors = await page.query_selector_all('a[href*="/video/"]')
+        for a in anchors:
+            href = await a.get_attribute("href")
+            if href and "/video/" in href:
                 place.tiktok_video_url = href if href.startswith("http") else f"https://www.tiktok.com{href}"
-            return place
-
-        await page.mouse.wheel(0, 2800)
-        await page.wait_for_timeout(900)
+                return place
+        try:
+            await page.mouse.wheel(0, 1600)
+        except Exception:
+            pass
+        await page.wait_for_timeout(500)
 
     return place
 
@@ -460,54 +384,39 @@ async def add_tiktok_videos_to_df(
     df: pd.DataFrame,
     name_col: str,
     address_col: str,
-    fallback_col: str | None = None,
     headless: bool = True,
-    tt_state_path: str | None = "tt_state.json",
-    throttle_ms: int = 700,
+    tt_state_path: str = "tt_state.json",
 ) -> pd.DataFrame:
-    """
-    Ajoute:
-      - tiktok_query
-      - tiktok_video
-    Utilise storage_state si fourni.
-    """
     df = df.copy()
     df["tiktok_query"] = None
     df["tiktok_video"] = None
 
+    # ✅ si storage state absent, on ne plante pas
+    storage_state = tt_state_path if tt_state_path and Path(tt_state_path).exists() else None
+    if tt_state_path and storage_state is None:
+        logging.warning("[tiktok] tt_state introuvable (%s) -> on continue sans storageState", tt_state_path)
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
 
-        context_kwargs = {
-            "locale": "fr-FR",
-            "viewport": {"width": 1280, "height": 800},
-        }
-        if tt_state_path:
-            context_kwargs["storage_state"] = tt_state_path
+        context_kwargs = {}
+        if storage_state:
+            context_kwargs["storage_state"] = storage_state
 
         context = await browser.new_context(**context_kwargs)
         page = await context.new_page()
 
         for i, row in df.iterrows():
-            name = row.get(name_col)
-            address = row.get(address_col)
-            fallback = row.get(fallback_col) if fallback_col else None
-
-            query = build_query(name, address, fallback)
+            name = safe_str(row.get(name_col))
+            address = safe_str(row.get(address_col))
+            query = build_query(name, address, fallback=safe_str(row.get("category")))
             df.at[i, "tiktok_query"] = query
-            if not query:
-                continue
 
-            place = TikTokPlace(
-                name=safe_str(name) or None,
-                address=safe_str(address) or None,
-                query_text=safe_str(fallback) or None,
-            )
-
-            updated = await find_tiktok_video(page, place)
-            df.at[i, "tiktok_video"] = updated.tiktok_video_url
-
-            await page.wait_for_timeout(throttle_ms)
+            try:
+                updated = await find_tiktok_video(page, TikTokPlace(name=name, address=address))
+                df.at[i, "tiktok_video"] = updated.tiktok_video_url
+            except Exception:
+                df.at[i, "tiktok_video"] = None
 
         await context.close()
         await browser.close()
@@ -516,7 +425,7 @@ async def add_tiktok_videos_to_df(
 
 
 # ============================================================
-# 5) Optional CLI runner
+# Pipeline
 # ============================================================
 
 async def run_pipeline(
@@ -526,9 +435,15 @@ async def run_pipeline(
     do_geocode: bool = False,
     geocode_cache: str = "geocode_cache.csv",
     tt_state_path: str = "tt_state.json",
-    headless: bool = False,
+    headless: bool = True,
+    debug_limit_rows: int | None = None,   # ✅ NEW
 ) -> pd.DataFrame:
     df = load_all_google_excels(root_folder=root_folder)
+
+    # ✅ debug limit AVANT geocode + playwright
+    if debug_limit_rows is not None:
+        df = df.head(int(debug_limit_rows)).copy()
+        logging.warning("🧪 [debug] Limitation DataFrame à %s lignes (debug_limit_rows=%s)", len(df), debug_limit_rows)
 
     if do_geocode:
         df = add_lat_lng(df, address_col=address_col, cache_path=geocode_cache)
@@ -558,6 +473,7 @@ def main():
     parser.add_argument("--geocode", action="store_true", help="Also compute latitude/longitude (requires geopy)")
     parser.add_argument("--geocode-cache", default="geocode_cache.csv", help="CSV cache file for geocoding")
     parser.add_argument("--tt-state", default="tt_state.json", help="TikTok storage_state file")
+    parser.add_argument("--debug-limit-rows", type=int, default=None, help="Limit rows before enrichment")
     parser.add_argument("--out", default="enriched.csv", help="Output CSV path")
     args = parser.parse_args()
 
@@ -571,6 +487,7 @@ def main():
             geocode_cache=args.geocode_cache,
             tt_state_path=args.tt_state,
             headless=args.headless,
+            debug_limit_rows=args.debug_limit_rows,
         )
     )
     df.to_csv(args.out, index=False)
