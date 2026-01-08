@@ -313,7 +313,7 @@ with DAG(
             "website_col": "MRe4xd href",
 
             # Playwright
-            "headless": False,                         # pour debug, passe à True si ok
+            "headless": True,                         # pour debug, passe à True si ok
             "tt_state_path": "/opt/airflow/data/tt_state.json",
 
             # Geocode optionnel (si geopy + cache)
