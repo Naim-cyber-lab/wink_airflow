@@ -35,6 +35,7 @@ services:
       - ./videos:/opt/airflow/videos/
       - ./dags:/opt/airflow/dags
       - ./services:/opt/airflow/services
+      - ./data:/opt/airflow/data
       - ./requirements.txt:/opt/airflow/requirements.txt
       - ./script/entrypoint.sh:/entrypoint.sh
     entrypoint: /entrypoint.sh
