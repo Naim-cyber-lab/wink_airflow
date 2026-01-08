@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import logging
 import re
@@ -49,7 +50,7 @@ def file_index(path: Path) -> int:
 
 
 def normalize_category(folder_name: str) -> str:
-    """restaurant-paris-asiatiques -> restaurant paris asiatiques"""
+    """bar-paris -> bar paris"""
     return folder_name.replace("-", " ").strip()
 
 
@@ -89,7 +90,7 @@ def load_all_google_excels(
     """
     Parcourt root_folder, charge google.xlsx + google (n).xlsx de chaque sous-dossier.
     Ajoute:
-      - category
+      - category (nom du dossier normalisé)
       - source_file
       - source_folder
       - row_id
@@ -153,52 +154,28 @@ def load_all_google_excels(
 # 2) Lat/Lng (optional) with cache
 # ============================================================
 
-def choose_address_col(df: pd.DataFrame) -> str:
-    patterns = [
-        r"\brue\b", r"\bbd\b", r"\bboulevard\b", r"\bavenue\b", r"\bav\b",
-        r"\bplace\b", r"\bquai\b", r"\ballée\b", r"\bimpasse\b",
-        r"\bparis\b", r"\b750\d{2}\b"
-    ]
-    regex = re.compile("|".join(patterns), re.IGNORECASE)
-
-    ignore = {"source_file", "source_folder", "category", "row_id", "latitude", "longitude"}
-    best_col, best_score = None, -1
-
-    for c in df.columns:
-        if c in ignore:
-            continue
-        s = df[c].dropna().astype(str)
-        if s.empty:
-            continue
-        sample = s.head(300)
-        score = sample.apply(lambda x: 1 if regex.search(x) else 0).sum()
-        if score > best_score:
-            best_col, best_score = c, score
-
-    if not best_col or best_score == 0:
-        raise ValueError("Colonne adresse introuvable automatiquement. Passe address_col explicitement.")
-    return best_col
-
-
 def add_lat_lng(
     df: pd.DataFrame,
-    address_col: str | None = None,
+    address_col: str,
     cache_path: str = "geocode_cache.csv",
     min_delay_seconds: float = 1.1,
     timeout_seconds: int = 10,
 ) -> pd.DataFrame:
+    """
+    Ajoute latitude/longitude à partir d'une colonne d'adresse.
+    Utilise un cache CSV (_addr, latitude, longitude).
+    """
     if Nominatim is None or RateLimiter is None:
         raise ImportError("geopy n'est pas installé. pip install geopy")
 
     df = df.copy()
 
-    if address_col is None:
-        address_col = choose_address_col(df)
-    logging.info("[geo] Colonne adresse utilisée: %s", address_col)
+    if address_col not in df.columns:
+        raise ValueError(f"address_col='{address_col}' introuvable dans le dataframe.")
 
-    addr = df[address_col].astype(str).fillna("").str.strip()
-
+    # normalisation (Paris/France) pour avoir des coords cohérentes
     def normalize(a: str) -> str:
+        a = safe_str(a)
         if not a or a.lower() == "nan":
             return ""
         a_low = a.lower()
@@ -208,9 +185,11 @@ def add_lat_lng(
             a = f"{a}, France"
         return a
 
-    df["_addr"] = addr.map(normalize)
+    df["_addr"] = df[address_col].astype(str).fillna("").map(normalize)
 
     cache_file = Path(cache_path)
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+
     if cache_file.exists():
         cache_df = pd.read_csv(cache_file)
     else:
@@ -290,12 +269,8 @@ async def find_youtube_short(page, place: Place) -> Place:
         href = await a.get_attribute("href")
         if not href:
             continue
-        # shorts often contain /shorts/
         if "/shorts/" in href:
-            if href.startswith("http"):
-                place.youtube_short_url = href
-            else:
-                place.youtube_short_url = f"https://www.youtube.com{href}"
+            place.youtube_short_url = href if href.startswith("http") else f"https://www.youtube.com{href}"
             return place
     return place
 
@@ -391,7 +366,6 @@ async def add_tiktok_videos_to_df(
     df["tiktok_query"] = None
     df["tiktok_video"] = None
 
-    # ✅ si storage state absent, on ne plante pas
     storage_state = tt_state_path if tt_state_path and Path(tt_state_path).exists() else None
     if tt_state_path and storage_state is None:
         logging.warning("[tiktok] tt_state introuvable (%s) -> on continue sans storageState", tt_state_path)
@@ -432,11 +406,11 @@ async def run_pipeline(
     root_folder: str,
     name_col: str,
     address_col: str,
-    do_geocode: bool = False,
+    do_geocode: bool = True,
     geocode_cache: str = "geocode_cache.csv",
     tt_state_path: str = "tt_state.json",
     headless: bool = True,
-    debug_limit_rows: int | None = None,   # ✅ NEW
+    debug_limit_rows: int | None = None,   # ✅ debug
 ) -> pd.DataFrame:
     df = load_all_google_excels(root_folder=root_folder)
 
@@ -448,19 +422,8 @@ async def run_pipeline(
     if do_geocode:
         df = add_lat_lng(df, address_col=address_col, cache_path=geocode_cache)
 
-    df = await add_youtube_shorts_to_df(
-        df,
-        name_col=name_col,
-        address_col=address_col,
-        headless=headless,
-    )
-    df = await add_tiktok_videos_to_df(
-        df,
-        name_col=name_col,
-        address_col=address_col,
-        headless=headless,
-        tt_state_path=tt_state_path,
-    )
+    df = await add_youtube_shorts_to_df(df, name_col=name_col, address_col=address_col, headless=headless)
+    df = await add_tiktok_videos_to_df(df, name_col=name_col, address_col=address_col, headless=headless, tt_state_path=tt_state_path)
     return df
 
 
@@ -477,7 +440,6 @@ def main():
     parser.add_argument("--out", default="enriched.csv", help="Output CSV path")
     args = parser.parse_args()
 
-    import asyncio
     df = asyncio.run(
         run_pipeline(
             root_folder=args.root,

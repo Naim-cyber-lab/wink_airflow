@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import psycopg2
+from psycopg2 import sql
 from airflow import DAG
 from airflow.hooks.base import BaseHook
 from airflow.operators.python import PythonOperator
@@ -29,18 +30,18 @@ DAG_DOC = r"""
 - Enrichit avec:
   - youtube_query, youtube_short
   - tiktok_query, tiktok_video
-  - latitude/longitude (optionnel via geocode)
+  - latitude/longitude (via geocode)
 - Upsert dans `profil_event`
 
-## Mode debug (rapide)
+## Debug rapide
 - `debug_limit_rows: 5` => limite le dataframe à 5 lignes AVANT Playwright + geocode.
-- Pour revenir au comportement normal: mets `debug_limit_rows: None`.
+- Pour revenir au normal: mets `debug_limit_rows: None`.
 """
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # Helpers
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 POSTAL_RE = re.compile(r"\b(\d{5})\b")
 
 
@@ -95,8 +96,8 @@ def _build_bio(
     tiktok_video: str | None,
 ) -> str:
     """
-    On met TOUT ce qui est "enrichissement" dans bioEvent
-    (surtout si la DB n'a pas de colonnes dédiées).
+    On met TOUT ce qui est enrichissement dans bioEvent,
+    même si on a aussi des colonnes dédiées.
     """
     base = safe_str(old_bio)
     lines = [base] if base else []
@@ -120,9 +121,38 @@ def _build_bio(
     return "\n".join([l for l in lines if l]).strip()
 
 
-# -----------------------------------------------------------------------------
-# Task 1: Enrich + export CSV
-# -----------------------------------------------------------------------------
+def _exec_insert(cursor, table: str, data: dict[str, object]):
+    cols = [sql.Identifier(c) for c in data.keys()]
+    placeholders = [sql.Placeholder() for _ in data.keys()]
+    query = sql.SQL("INSERT INTO {t} ({cols}) VALUES ({vals}) RETURNING id").format(
+        t=sql.Identifier(table),
+        cols=sql.SQL(", ").join(cols),
+        vals=sql.SQL(", ").join(placeholders),
+    )
+    cursor.execute(query, list(data.values()))
+    return cursor.fetchone()[0]
+
+
+def _exec_update(cursor, table: str, event_id: int, data: dict[str, object]):
+    """
+    UPDATE table SET col=%s,... WHERE id=%s
+    """
+    assignments = [
+        sql.SQL("{} = {}").format(sql.Identifier(k), sql.Placeholder())
+        for k in data.keys()
+    ]
+    query = sql.SQL("UPDATE {t} SET {assignments} WHERE id = {id_col}").format(
+        t=sql.Identifier(table),
+        assignments=sql.SQL(", ").join(assignments),
+        id_col=sql.SQL("id = %s"),
+    )
+    values = list(data.values()) + [event_id]
+    cursor.execute(query, values)
+
+
+# ---------------------------------------------------------------------
+# Task 1: enrich + export csv
+# ---------------------------------------------------------------------
 def enrich_and_export_csv(**context):
     params = context["params"]
 
@@ -134,12 +164,12 @@ def enrich_and_export_csv(**context):
     headless = bool(params.get("headless", True))
     tt_state_path = params.get("tt_state_path")
 
-    # Geocode (lat/lon)
+    # Geocode
     do_geocode = bool(params.get("do_geocode", True))
     geocode_cache = params.get("geocode_cache", "/opt/airflow/data/geocode_cache.csv")
 
-    # 🧪 DEBUG (facile à enlever)
-    debug_limit_rows = params.get("debug_limit_rows", 5)  # mets None pour full dataframe
+    # 🧪 Debug
+    debug_limit_rows = params.get("debug_limit_rows", 5)  # mets None pour full
 
     output_dir = params.get("output_dir", "/opt/airflow/data")
     os.makedirs(output_dir, exist_ok=True)
@@ -155,7 +185,7 @@ def enrich_and_export_csv(**context):
             geocode_cache=geocode_cache,
             tt_state_path=tt_state_path,
             headless=headless,
-            debug_limit_rows=debug_limit_rows,  # <= NEW
+            debug_limit_rows=debug_limit_rows,
         )
     )
 
@@ -175,14 +205,14 @@ def enrich_and_export_csv(**context):
             df[col] = None
 
     df.to_csv(out_csv, index=False)
-    logging.info(f"✅ [enrich] Exported: {out_csv} | rows={len(df)}")
+    logging.info("✅ [enrich] Exported: %s | rows=%s", out_csv, len(df))
 
     context["ti"].xcom_push(key="enriched_csv_path", value=out_csv)
 
 
-# -----------------------------------------------------------------------------
-# Task 2: Upsert DB
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Task 2: upsert
+# ---------------------------------------------------------------------
 def upsert_events_from_csv(**context):
     params = context["params"]
 
@@ -190,7 +220,10 @@ def upsert_events_from_csv(**context):
     address_col = params["address_col"]
     website_col = params.get("website_col", "MRe4xd href")
 
-    region_default = params.get("region_default", "Paris")  # ✅ region fixe
+    # ✅ IMPORTANT: region = category (dossier) par défaut
+    region_default = params.get("region_default", "Paris")
+    use_category_as_region = bool(params.get("use_category_as_region", True))
+
     creator_winker_id = int(params.get("creator_winker_id", 116))
     active_default = int(params.get("active_default", 0))
     max_participants = int(params.get("max_participants", 99999999))
@@ -203,7 +236,7 @@ def upsert_events_from_csv(**context):
         raise FileNotFoundError(f"Enriched CSV not found: {csv_path}")
 
     df = pd.read_csv(csv_path)
-    logging.info(f"📥 [db] Loading CSV rows={len(df)} from {csv_path}")
+    logging.info("📥 [db] Loading CSV rows=%s from %s", len(df), csv_path)
 
     conn = BaseHook.get_connection(DB_CONN_ID)
     connection = psycopg2.connect(
@@ -215,13 +248,13 @@ def upsert_events_from_csv(**context):
     )
     cursor = connection.cursor()
 
+    inserted = 0
+    updated = 0
+    skipped = 0
+
     try:
         cols = _get_table_columns(cursor, "profil_event")
-        logging.info(f"🧱 [db] profil_event columns detected: {len(cols)} cols")
-
-        inserted = 0
-        updated = 0
-        skipped = 0
+        logging.info("🧱 [db] profil_event columns detected: %s cols", len(cols))
 
         for _, row in df.iterrows():
             titre = safe_str(row.get(name_col))
@@ -230,26 +263,24 @@ def upsert_events_from_csv(**context):
                 skipped += 1
                 continue
 
-            # ✅ Region/city
+            category = safe_str(row.get("category")) or None
+
+            # ✅ region depuis category (bar paris / escape game paris / etc)
+            region = (category if (use_category_as_region and category) else safe_str(region_default)) or "Paris"
+
             city = guess_city(adresse) or "Paris"
-            region = region_default
             code_postal = extract_postal_code(adresse)
 
-            # from DF
-            category = safe_str(row.get("category")) or None
             website = safe_str(row.get(website_col)) or None
+            price = safe_str(row.get("price")) or None
 
             youtube_query = safe_str(row.get("youtube_query")) or None
             youtube_short = safe_str(row.get("youtube_short")) or None
             tiktok_query = safe_str(row.get("tiktok_query")) or None
             tiktok_video = safe_str(row.get("tiktok_video")) or None
 
-            # lat/lon (geocode)
             lat = row.get("latitude", None)
             lon = row.get("longitude", None)
-
-            # price (si présent dans tes excels)
-            price = safe_str(row.get("price")) or None
 
             # 1) existing?
             cursor.execute(
@@ -279,9 +310,8 @@ def upsert_events_from_csv(**context):
 
                 update_map: dict[str, object] = {}
 
-                # always update bioEvent (safe)
                 if "bioEvent" in cols:
-                    update_map['"bioEvent"'] = new_bio
+                    update_map["bioEvent"] = new_bio
 
                 # website: fill if missing
                 if "website" in cols and (old_website is None and website is not None):
@@ -293,7 +323,15 @@ def upsert_events_from_csv(**context):
                 if "lon" in cols and old_lon is None and lon is not None:
                     update_map["lon"] = float(lon)
 
-                # optionally keep enriched columns if DB has them
+                # region/city/codePostal
+                if "region" in cols:
+                    update_map["region"] = region
+                if "city" in cols:
+                    update_map["city"] = city
+                if "codePostal" in cols and code_postal:
+                    update_map["codePostal"] = code_postal
+
+                # enrich columns if exist
                 if "youtube_query" in cols and youtube_query:
                     update_map["youtube_query"] = youtube_query
                 if "youtube_short" in cols and youtube_short:
@@ -306,23 +344,9 @@ def upsert_events_from_csv(**context):
                     update_map["price"] = price
                 if "category" in cols and category:
                     update_map["category"] = category
-                if "region" in cols:
-                    update_map["region"] = region
-                if "city" in cols:
-                    update_map["city"] = city
-                if "codePostal" in cols and code_postal:
-                    update_map['"codePostal"'] = code_postal
 
                 if update_map:
-                    set_parts = []
-                    values = []
-                    for k, v in update_map.items():
-                        set_parts.append(f"{k} = %s")
-                        values.append(v)
-                    values.append(event_id)
-
-                    sql = f'UPDATE profil_event SET {", ".join(set_parts)} WHERE id = %s'
-                    cursor.execute(sql, values)
+                    _exec_update(cursor, "profil_event", int(event_id), update_map)
 
                 updated += 1
                 continue
@@ -341,39 +365,41 @@ def upsert_events_from_csv(**context):
 
             insert_map: dict[str, object] = {}
 
-            # core fields
+            # core
             if "titre" in cols:
                 insert_map["titre"] = titre
             if "titre_fr" in cols:
-                insert_map["titre_fr"] = titre  # simple fallback
+                insert_map["titre_fr"] = titre
             if "adresse" in cols:
                 insert_map["adresse"] = adresse
+
             if "region" in cols:
                 insert_map["region"] = region
             if "city" in cols:
                 insert_map["city"] = city
             if "codePostal" in cols:
-                insert_map['"codePostal"'] = code_postal
+                insert_map["codePostal"] = code_postal
+
             if "bioEvent" in cols:
-                insert_map['"bioEvent"'] = bio_event
+                insert_map["bioEvent"] = bio_event
             if "website" in cols:
                 insert_map["website"] = website
 
+            # required/not null
+            if "nbStories" in cols:
+                insert_map["nbStories"] = 0
+
             # creator / flags
             if "creatorWinker_id" in cols:
-                insert_map['"creatorWinker_id"'] = creator_winker_id
+                insert_map["creatorWinker_id"] = creator_winker_id
             if "active" in cols:
                 insert_map["active"] = active_default
             if "maxNumberParticipant" in cols:
-                insert_map['"maxNumberParticipant"'] = max_participants
+                insert_map["maxNumberParticipant"] = max_participants
             if "accessComment" in cols:
-                insert_map['"accessComment"'] = access_comment
+                insert_map["accessComment"] = access_comment
             if "validated_from_web" in cols:
                 insert_map["validated_from_web"] = validated_from_web
-
-            # required not-null seen earlier
-            if "nbStories" in cols:
-                insert_map['"nbStories"'] = 0
 
             # lat/lon
             if "lat" in cols and lat is not None:
@@ -381,7 +407,7 @@ def upsert_events_from_csv(**context):
             if "lon" in cols and lon is not None:
                 insert_map["lon"] = float(lon)
 
-            # enriched columns if exist
+            # enrich columns if exist
             if "youtube_query" in cols:
                 insert_map["youtube_query"] = youtube_query
             if "youtube_short" in cols:
@@ -398,31 +424,24 @@ def upsert_events_from_csv(**context):
             if not insert_map:
                 raise RuntimeError("Aucune colonne détectée pour insert dans profil_event (schéma inattendu).")
 
-            columns_sql = ", ".join(insert_map.keys())
-            placeholders = ", ".join(["%s"] * len(insert_map))
-            values = list(insert_map.values())
-
-            cursor.execute(
-                f"INSERT INTO profil_event ({columns_sql}) VALUES ({placeholders}) RETURNING id"
-            )
-            cursor.fetchone()
+            _exec_insert(cursor, "profil_event", insert_map)
             inserted += 1
 
         connection.commit()
-        logging.info(f"✅ [db] Inserted={inserted} Updated={updated} Skipped={skipped}")
+        logging.info("✅ [db] Inserted=%s Updated=%s Skipped=%s", inserted, updated, skipped)
 
     except Exception as e:
         connection.rollback()
-        logging.error(f"❌ [db] Failure: {e}")
+        logging.error("❌ [db] Failure: %s", e)
         raise
     finally:
         cursor.close()
         connection.close()
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # DAG
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 default_args = {
     "owner": "airflow",
     "retries": 1,
@@ -454,14 +473,13 @@ with DAG(
             "headless": True,
             "tt_state_path": "/opt/airflow/data/tt_state.json",
 
-            # ✅ Geocode ON (pour corriger lat/lon)
+            # ✅ Geocode ON pour corriger lat/lon
             "do_geocode": True,
             "geocode_cache": "/opt/airflow/data/geocode_cache.csv",
 
-            # 🧪 DEBUG (mets None pour revenir au normal)
+            # 🧪 DEBUG: mets None pour revenir au normal
             "debug_limit_rows": 5,
 
-            # Output
             "output_dir": "/opt/airflow/data",
         },
     )
@@ -475,8 +493,10 @@ with DAG(
             "address_col": "rllt__details 3",
             "website_col": "MRe4xd href",
 
-            # Defaults DB
+            # ✅ region = category par défaut
+            "use_category_as_region": True,
             "region_default": "Paris",
+
             "creator_winker_id": 116,
             "active_default": 0,
             "max_participants": 99999999,
