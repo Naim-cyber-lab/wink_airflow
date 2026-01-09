@@ -27,15 +27,22 @@ except Exception:
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+GOOGLE_FILE_RE = re.compile(r"^google(?: \(\d+\))?\.xlsx$", re.IGNORECASE)
+
+YOUTUBE_SHORTS_URL_RE = re.compile(r"^https?://(www\.)?youtube\.com/shorts/[^/?#]+", re.IGNORECASE)
+TIKTOK_VIDEO_URL_RE = re.compile(r"^https?://(www\.)?tiktok\.com/@[^/]+/video/\d+", re.IGNORECASE)
+
+INSTAGRAM_REEL_RE = re.compile(
+    r"https?://(?:www\.)?instagram\.com/(?:reel|reels)/[A-Za-z0-9_\-]+/?",
+    re.IGNORECASE,
+)
+
+
 # ============================================================
 # Utils
 # ============================================================
 
-GOOGLE_FILE_RE = re.compile(r"^google(?: \(\d+\))?\.xlsx$", re.IGNORECASE)
-
-
 def safe_str(x) -> str:
-    """Retourne une string clean, ou '' si NaN/None."""
     if x is None:
         return ""
     try:
@@ -47,7 +54,6 @@ def safe_str(x) -> str:
 
 
 def file_index(path: Path) -> int:
-    """google.xlsx -> 0, google (1).xlsx -> 1, etc."""
     if path.stem.lower() == "google":
         return 0
     m = re.match(r"^google \((\d+)\)$", path.stem.lower())
@@ -55,12 +61,10 @@ def file_index(path: Path) -> int:
 
 
 def normalize_category(folder_name: str) -> str:
-    """bar-paris -> bar paris"""
     return folder_name.replace("-", " ").strip()
 
 
 def compute_row_id(row: pd.Series, key_cols: list[str]) -> str:
-    """ID stable: hash sha1 sur la concat des colonnes clé (normalisées)."""
     parts = []
     for c in key_cols:
         v = row.get(c, "")
@@ -74,9 +78,6 @@ def compute_row_id(row: pd.Series, key_cols: list[str]) -> str:
 
 
 def build_query(name, address, fallback=None) -> str:
-    """
-    Query = nom + adresse (et fallback si le nom est vide)
-    """
     name = safe_str(name)
     address = safe_str(address)
     fallback = safe_str(fallback)
@@ -92,15 +93,6 @@ def load_all_google_excels(
     root_folder: str = ".",
     dedupe_key_cols: list[str] | None = None,
 ) -> pd.DataFrame:
-    """
-    Parcourt root_folder, charge google.xlsx + google (n).xlsx de chaque sous-dossier.
-    Ajoute:
-      - category (nom du dossier normalisé)
-      - source_file
-      - source_folder
-      - row_id
-    Déduplique sur row_id.
-    """
     root = Path(root_folder).resolve()
     if not root.exists():
         raise FileNotFoundError(f"Dossier root introuvable: {root}")
@@ -166,10 +158,6 @@ def add_lat_lng(
     min_delay_seconds: float = 1.1,
     timeout_seconds: int = 10,
 ) -> pd.DataFrame:
-    """
-    Ajoute latitude/longitude à partir d'une colonne d'adresse.
-    Utilise un cache CSV (_addr, latitude, longitude).
-    """
     if Nominatim is None or RateLimiter is None:
         raise ImportError("geopy n'est pas installé. pip install geopy")
 
@@ -251,17 +239,10 @@ def add_lat_lng(
 
 
 # ============================================================
-# 3) YouTube Shorts (✅ robust + liste)
+# 3) YouTube Shorts => LISTE, stockée dans youtube_video (JSON string)
 # ============================================================
 
-YOUTUBE_SHORTS_URL_RE = re.compile(r"^https?://(www\.)?youtube\.com/shorts/[^/?#]+", re.IGNORECASE)
-
-
 async def _handle_youtube_consent_best_effort(page) -> None:
-    """
-    Best effort : clique si un bouton cookie est présent.
-    Ne doit jamais faire planter le scraping.
-    """
     candidates = [
         "button:has-text('Tout accepter')",
         "button:has-text('J’accepte')",
@@ -294,14 +275,6 @@ async def find_youtube_shorts_list(
     max_results: int = 5,
     scroll_steps: int = 6,
 ) -> list[str]:
-    """
-    Retourne une liste de liens YouTube Shorts (max_results).
-    Stratégie robuste :
-    - aller sur results
-    - gérer consent best effort
-    - scroll un peu
-    - récupérer a[href*="/shorts/"] dans le DOM
-    """
     url = "https://www.youtube.com/results?search_query=" + quote_plus(query)
     await page.goto(url, wait_until="domcontentloaded", timeout=60000)
     await page.wait_for_timeout(2000)
@@ -323,7 +296,6 @@ async def find_youtube_shorts_list(
             continue
         if href.startswith("/"):
             href = "https://www.youtube.com" + href
-        # normalize a bit
         href = href.split("&")[0]
         if YOUTUBE_SHORTS_URL_RE.match(href) and href not in results:
             results.append(href)
@@ -341,23 +313,19 @@ async def add_youtube_shorts_to_df(
     max_results: int = 5,
 ) -> pd.DataFrame:
     """
-    Ajoute:
-      - youtube_query (str)
-      - youtube_short (str) => premier short (compat DB)
-      - youtube_shorts (str JSON) => liste complète (max_results)
+    Colonnes produites :
+      - youtube_query
+      - youtube_video  -> JSON string d'une liste de shorts (textfield DB)
+      - youtube_video_first -> 1er short (pratique pour bio)
     """
     df = df.copy()
-    if "youtube_query" not in df.columns:
-        df["youtube_query"] = None
-    df["youtube_short"] = None
-    df["youtube_shorts"] = None
+    df["youtube_query"] = None
+    df["youtube_video"] = None
+    df["youtube_video_first"] = None
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 720},
-            locale="fr-FR",
-        )
+        context = await browser.new_context(viewport={"width": 1280, "height": 720}, locale="fr-FR")
         page = await context.new_page()
 
         for i, row in df.iterrows():
@@ -368,12 +336,12 @@ async def add_youtube_shorts_to_df(
 
             try:
                 shorts = await find_youtube_shorts_list(page, query, max_results=max_results)
-                df.at[i, "youtube_short"] = shorts[0] if shorts else None
-                df.at[i, "youtube_shorts"] = json.dumps(shorts, ensure_ascii=False) if shorts else None
+                df.at[i, "youtube_video_first"] = shorts[0] if shorts else None
+                df.at[i, "youtube_video"] = json.dumps(shorts, ensure_ascii=False) if shorts else None
             except Exception as e:
                 logging.warning("[youtube] failed for query=%r err=%s", query, e)
-                df.at[i, "youtube_short"] = None
-                df.at[i, "youtube_shorts"] = None
+                df.at[i, "youtube_video_first"] = None
+                df.at[i, "youtube_video"] = None
 
         await context.close()
         await browser.close()
@@ -382,14 +350,14 @@ async def add_youtube_shorts_to_df(
 
 
 # ============================================================
-# 4) TikTok
+# 4) TikTok => LISTE, stockée dans tiktok_video (JSON string)
 # ============================================================
 
 @dataclass
 class TikTokPlace:
     name: str
     address: str
-    tiktok_video_url: Optional[str] = None
+    tiktok_video_urls: list[str]
 
 
 async def _dismiss_tiktok_popups(page) -> None:
@@ -403,29 +371,47 @@ async def _dismiss_tiktok_popups(page) -> None:
         await page.wait_for_timeout(200)
 
 
-async def find_tiktok_video(page, place: TikTokPlace, max_scrolls: int = 12) -> TikTokPlace:
-    query = quote_plus(f"{place.name} {place.address} paris")
-    url = f"https://www.tiktok.com/search?q={query}"
+async def find_tiktok_videos_list(
+    page,
+    query: str,
+    *,
+    max_results: int = 5,
+    max_scrolls: int = 12,
+) -> list[str]:
+    """
+    TikTok search, récupère jusqu'à max_results liens /video/
+    """
+    url = f"https://www.tiktok.com/search?q={quote_plus(query)}"
     await page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
     await _dismiss_tiktok_popups(page)
-    await page.wait_for_timeout(1000)
+    await page.wait_for_timeout(1200)
+
+    results: list[str] = []
 
     for _ in range(max_scrolls):
         await _dismiss_tiktok_popups(page)
+
         anchors = await page.query_selector_all('a[href*="/video/"]')
         for a in anchors:
             href = await a.get_attribute("href")
-            if href and "/video/" in href:
-                place.tiktok_video_url = href if href.startswith("http") else f"https://www.tiktok.com{href}"
-                return place
+            if not href:
+                continue
+            if href.startswith("/"):
+                href = "https://www.tiktok.com" + href
+            href = href.split("?")[0]
+            if TIKTOK_VIDEO_URL_RE.match(href) and href not in results:
+                results.append(href)
+            if len(results) >= max_results:
+                return results
+
         try:
             await page.mouse.wheel(0, 1600)
         except Exception:
             pass
-        await page.wait_for_timeout(500)
+        await page.wait_for_timeout(600)
 
-    return place
+    return results
 
 
 async def add_tiktok_videos_to_df(
@@ -434,10 +420,18 @@ async def add_tiktok_videos_to_df(
     address_col: str,
     headless: bool = True,
     tt_state_path: str = "tt_state.json",
+    max_results: int = 5,
 ) -> pd.DataFrame:
+    """
+    Colonnes produites :
+      - tiktok_query
+      - tiktok_video -> JSON string liste de vidéos (textfield DB)
+      - tiktok_video_first
+    """
     df = df.copy()
     df["tiktok_query"] = None
     df["tiktok_video"] = None
+    df["tiktok_video_first"] = None
 
     storage_state = tt_state_path if tt_state_path and Path(tt_state_path).exists() else None
     if tt_state_path and storage_state is None:
@@ -460,9 +454,11 @@ async def add_tiktok_videos_to_df(
             df.at[i, "tiktok_query"] = query
 
             try:
-                updated = await find_tiktok_video(page, TikTokPlace(name=name, address=address))
-                df.at[i, "tiktok_video"] = updated.tiktok_video_url
+                urls = await find_tiktok_videos_list(page, query, max_results=max_results)
+                df.at[i, "tiktok_video_first"] = urls[0] if urls else None
+                df.at[i, "tiktok_video"] = json.dumps(urls, ensure_ascii=False) if urls else None
             except Exception:
+                df.at[i, "tiktok_video_first"] = None
                 df.at[i, "tiktok_video"] = None
 
         await context.close()
@@ -474,12 +470,6 @@ async def add_tiktok_videos_to_df(
 # ============================================================
 # 5) Instagram (best effort, no login) via DuckDuckGo HTML
 # ============================================================
-
-INSTAGRAM_REEL_RE = re.compile(
-    r"https?://(?:www\.)?instagram\.com/(?:reel|reels)/[A-Za-z0-9_\-]+/?",
-    re.IGNORECASE,
-)
-
 
 def _duckduckgo_html_search(query: str, timeout: int = 20) -> str:
     url = "https://duckduckgo.com/html/?q=" + quote_plus(query)
@@ -522,7 +512,6 @@ def add_instagram_reels_to_df(df: pd.DataFrame, name_col: str, address_col: str)
         address = safe_str(row.get(address_col))
         query = build_query(name, address, fallback=safe_str(row.get("category")))
         df.at[i, "instagram_query"] = query
-
         try:
             df.at[i, "instagram_reel"] = find_instagram_reel_link(query)
         except Exception:
@@ -557,23 +546,17 @@ async def run_pipeline(
     if do_geocode:
         df = add_lat_lng(df, address_col=address_col, cache_path=geocode_cache)
 
-    # Colonnes stables
+    # colonnes stables
     for c in [
-        "youtube_query", "youtube_short", "youtube_shorts",
-        "tiktok_query", "tiktok_video",
+        "youtube_query", "youtube_video", "youtube_video_first",
+        "tiktok_query", "tiktok_video", "tiktok_video_first",
         "instagram_query", "instagram_reel"
     ]:
         if c not in df.columns:
             df[c] = None
 
     if do_youtube:
-        df = await add_youtube_shorts_to_df(
-            df,
-            name_col=name_col,
-            address_col=address_col,
-            headless=headless,
-            max_results=5,
-        )
+        df = await add_youtube_shorts_to_df(df, name_col=name_col, address_col=address_col, headless=headless, max_results=5)
 
     if do_tiktok:
         df = await add_tiktok_videos_to_df(
@@ -582,6 +565,7 @@ async def run_pipeline(
             address_col=address_col,
             headless=headless,
             tt_state_path=tt_state_path,
+            max_results=5,
         )
 
     if do_instagram:
@@ -591,7 +575,7 @@ async def run_pipeline(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Enrich Google excels with YouTube Shorts + TikTok + Instagram (best effort).")
+    parser = argparse.ArgumentParser(description="Enrich Google excels with YouTube Shorts (list) + TikTok (list) + Instagram (best effort).")
     parser.add_argument("--root", default=".", help="Root folder containing subfolders with google*.xlsx")
     parser.add_argument("--name-col", required=True, help="Column name containing the place name")
     parser.add_argument("--address-col", required=True, help="Column name containing the address")

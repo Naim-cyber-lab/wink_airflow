@@ -31,7 +31,7 @@ DAG_DOC = r"""
 
 - Charge tous les `google.xlsx` / `google (n).xlsx` dans les sous-dossiers de `root_folder`
 - Enrichit avec:
-  - youtube_query, youtube_short, youtube_shorts (liste JSON)
+  - youtube_query, youtube_short, youtube_video (liste JSON)
   - tiktok_query, tiktok_video
   - instagram_query, instagram_reel
   - latitude/longitude (via geocode)
@@ -80,18 +80,18 @@ def _get_table_columns(cursor, table: str) -> set[str]:
     return {r[0] for r in cursor.fetchall()}
 
 
-def _format_youtube_shorts_for_bio(youtube_shorts_json: str | None) -> str | None:
-    if not youtube_shorts_json:
+def _format_youtube_video_for_bio(youtube_video_json: str | None) -> str | None:
+    if not youtube_video_json:
         return None
     try:
-        arr = json.loads(youtube_shorts_json)
+        arr = json.loads(youtube_video_json)
         if not isinstance(arr, list) or not arr:
             return None
         # 1 par ligne
         return "\n".join([f"- {u}" for u in arr[:10] if isinstance(u, str) and u.strip()])
     except Exception:
         # si c'est déjà du texte, on le garde tel quel
-        return youtube_shorts_json
+        return youtube_video_json
 
 
 def _build_bio(
@@ -102,7 +102,7 @@ def _build_bio(
     website: str | None,
     youtube_query: str | None,
     youtube_short: str | None,
-    youtube_shorts: str | None,
+    youtube_video: str | None,
     tiktok_query: str | None,
     tiktok_video: str | None,
     instagram_query: str | None,
@@ -126,7 +126,7 @@ def _build_bio(
     add_line("YouTube query", youtube_query)
     add_line("YouTube Shorts (first)", youtube_short)
 
-    yt_list = _format_youtube_shorts_for_bio(youtube_shorts)
+    yt_list = _format_youtube_video_for_bio(youtube_video)
     if yt_list:
         # bloc multi-lignes
         block_header = "YouTube Shorts (list):"
@@ -222,7 +222,7 @@ def enrich_and_export_csv(**context):
         "longitude",
         "youtube_query",
         "youtube_short",
-        "youtube_shorts",
+        "youtube_video",
         "tiktok_query",
         "tiktok_video",
         "instagram_query",
@@ -300,7 +300,7 @@ def upsert_events_from_csv(**context):
 
             youtube_query = safe_str(row.get("youtube_query")) or None
             youtube_short = safe_str(row.get("youtube_short")) or None
-            youtube_shorts = safe_str(row.get("youtube_shorts")) or None
+            youtube_video = safe_str(row.get("youtube_video")) or None
 
             tiktok_query = safe_str(row.get("tiktok_query")) or None
             tiktok_video = safe_str(row.get("tiktok_video")) or None
@@ -333,7 +333,7 @@ def upsert_events_from_csv(**context):
                     website=website or old_website,
                     youtube_query=youtube_query,
                     youtube_short=youtube_short,
-                    youtube_shorts=youtube_shorts,
+                    youtube_video=youtube_video,
                     tiktok_query=tiktok_query,
                     tiktok_video=tiktok_video,
                     instagram_query=instagram_query,
@@ -366,8 +366,8 @@ def upsert_events_from_csv(**context):
                 if "youtube_short" in cols and youtube_short:
                     update_map["youtube_short"] = youtube_short
                 # colonne optionnelle
-                if "youtube_shorts" in cols and youtube_shorts:
-                    update_map["youtube_shorts"] = youtube_shorts
+                if "youtube_video" in cols and youtube_video:
+                    update_map["youtube_video"] = youtube_video
 
                 # tiktok / insta
                 if "tiktok_query" in cols and tiktok_query:
@@ -398,7 +398,7 @@ def upsert_events_from_csv(**context):
                 website=website,
                 youtube_query=youtube_query,
                 youtube_short=youtube_short,
-                youtube_shorts=youtube_shorts,
+                youtube_video=youtube_video,
                 tiktok_query=tiktok_query,
                 tiktok_video=tiktok_video,
                 instagram_query=instagram_query,
@@ -448,10 +448,10 @@ def upsert_events_from_csv(**context):
             # ✅ youtube
             if "youtube_query" in cols:
                 insert_map["youtube_query"] = youtube_query
-            if "youtube_short" in cols:
+            if "youtube_video" in cols:
                 insert_map["youtube_short"] = youtube_short
-            if "youtube_shorts" in cols:
-                insert_map["youtube_shorts"] = youtube_shorts
+            if "youtube_video" in cols:
+                insert_map["youtube_video"] = youtube_video
 
             # tiktok / insta
             if "tiktok_query" in cols:
