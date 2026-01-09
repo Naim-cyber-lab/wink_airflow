@@ -27,15 +27,16 @@ PARIS_TZ = ZoneInfo("Europe/Paris")
 DB_CONN_ID = "my_postgres"
 
 DAG_DOC = r"""
-# 🎬 Import Events depuis Google Excels + enrichissement TikTok/YouTube/Instagram
+# 🎬 Import Events depuis Google Excels + enrichissement social
 
-- Charge tous les `google.xlsx` / `google (n).xlsx` dans les sous-dossiers de `root_folder`
-- Enrichit avec:
-  - youtube_query, youtube_short, youtube_video (liste JSON)
-  - tiktok_query, tiktok_video
-  - instagram_query, instagram_reel
-  - latitude/longitude (via geocode)
-- Upsert dans `profil_event`
+- YouTube:
+  - youtube_query
+  - youtube_video = JSON list de shorts (textfield)
+- TikTok:
+  - tiktok_query
+  - tiktok_video = JSON list (textfield)
+- Instagram:
+  - instagram_query / instagram_reel
 """
 
 POSTAL_RE = re.compile(r"\b(\d{5})\b")
@@ -80,31 +81,33 @@ def _get_table_columns(cursor, table: str) -> set[str]:
     return {r[0] for r in cursor.fetchall()}
 
 
-def _format_youtube_video_for_bio(youtube_video_json: str | None) -> str | None:
-    if not youtube_video_json:
-        return None
+def _json_preview_list(json_list_str: str | None, limit: int = 10) -> list[str]:
+    if not json_list_str:
+        return []
     try:
-        arr = json.loads(youtube_video_json)
-        if not isinstance(arr, list) or not arr:
-            return None
-        # 1 par ligne
-        return "\n".join([f"- {u}" for u in arr[:10] if isinstance(u, str) and u.strip()])
+        v = json.loads(json_list_str)
+        if isinstance(v, list):
+            out = []
+            for x in v:
+                if isinstance(x, str) and x.strip():
+                    out.append(x.strip())
+                if len(out) >= limit:
+                    break
+            return out
     except Exception:
-        # si c'est déjà du texte, on le garde tel quel
-        return youtube_video_json
+        pass
+    return []
 
 
 def _build_bio(
     old_bio: str,
     *,
     category: str | None,
-    price: str | None,
     website: str | None,
     youtube_query: str | None,
-    youtube_short: str | None,
-    youtube_video: str | None,
+    youtube_video_json: str | None,
     tiktok_query: str | None,
-    tiktok_video: str | None,
+    tiktok_video_json: str | None,
     instagram_query: str | None,
     instagram_reel: str | None,
 ) -> str:
@@ -120,24 +123,29 @@ def _build_bio(
             lines.append(line)
 
     add_line("Category", category)
-    add_line("Price", price)
     add_line("Website", website)
 
     add_line("YouTube query", youtube_query)
-    add_line("YouTube Shorts (first)", youtube_short)
-
-    yt_list = _format_youtube_video_for_bio(youtube_video)
+    yt_list = _json_preview_list(youtube_video_json)
     if yt_list:
-        # bloc multi-lignes
-        block_header = "YouTube Shorts (list):"
-        if block_header not in base:
-            lines.append(block_header)
-        for ln in yt_list.splitlines():
-            if ln and ln not in base:
-                lines.append(ln)
+        add_line("YouTube Shorts (first)", yt_list[0])
+        if "YouTube Shorts (list):" not in base:
+            lines.append("YouTube Shorts (list):")
+        for u in yt_list:
+            bullet = f"- {u}"
+            if bullet not in base:
+                lines.append(bullet)
 
     add_line("TikTok query", tiktok_query)
-    add_line("TikTok", tiktok_video)
+    tt_list = _json_preview_list(tiktok_video_json)
+    if tt_list:
+        add_line("TikTok (first)", tt_list[0])
+        if "TikTok (list):" not in base:
+            lines.append("TikTok (list):")
+        for u in tt_list:
+            bullet = f"- {u}"
+            if bullet not in base:
+                lines.append(bullet)
 
     add_line("Instagram query", instagram_query)
     add_line("Instagram Reel", instagram_reel)
@@ -213,27 +221,26 @@ def enrich_and_export_csv(**context):
         )
     )
 
-    # colonnes minimales attendues (CSV stable)
-    for col in [
+    # Colonnes attendues
+    expected = [
         "category",
         "source_folder",
         "source_file",
         "latitude",
         "longitude",
         "youtube_query",
-        "youtube_short",
         "youtube_video",
         "tiktok_query",
         "tiktok_video",
         "instagram_query",
         "instagram_reel",
-    ]:
+    ]
+    for col in expected:
         if col not in df.columns:
             df[col] = None
 
     df.to_csv(out_csv, index=False)
     logging.info("✅ [enrich] Exported: %s | rows=%s", out_csv, len(df))
-
     context["ti"].xcom_push(key="enriched_csv_path", value=out_csv)
 
 
@@ -291,19 +298,16 @@ def upsert_events_from_csv(**context):
 
             category = safe_str(row.get("category")) or None
             region = (category if (use_category_as_region and category) else safe_str(region_default)) or "Paris"
-
             city = guess_city(adresse) or "Paris"
             code_postal = extract_postal_code(adresse)
 
             website = safe_str(row.get(website_col)) or None
-            price = safe_str(row.get("price")) or None
 
             youtube_query = safe_str(row.get("youtube_query")) or None
-            youtube_short = safe_str(row.get("youtube_short")) or None
-            youtube_video = safe_str(row.get("youtube_video")) or None
+            youtube_video = safe_str(row.get("youtube_video")) or None  # ✅ JSON list shorts
 
             tiktok_query = safe_str(row.get("tiktok_query")) or None
-            tiktok_video = safe_str(row.get("tiktok_video")) or None
+            tiktok_video = safe_str(row.get("tiktok_video")) or None    # ✅ JSON list videos
 
             instagram_query = safe_str(row.get("instagram_query")) or None
             instagram_reel = safe_str(row.get("instagram_reel")) or None
@@ -311,7 +315,6 @@ def upsert_events_from_csv(**context):
             lat = row.get("latitude", None)
             lon = row.get("longitude", None)
 
-            # existing?
             cursor.execute(
                 """
                 SELECT id, "bioEvent", website, lat, lon
@@ -329,13 +332,11 @@ def upsert_events_from_csv(**context):
                 new_bio = _build_bio(
                     old_bio or "",
                     category=category,
-                    price=price,
                     website=website or old_website,
                     youtube_query=youtube_query,
-                    youtube_short=youtube_short,
-                    youtube_video=youtube_video,
+                    youtube_video_json=youtube_video,
                     tiktok_query=tiktok_query,
-                    tiktok_video=tiktok_video,
+                    tiktok_video_json=tiktok_video,
                     instagram_query=instagram_query,
                     instagram_reel=instagram_reel,
                 )
@@ -344,7 +345,6 @@ def upsert_events_from_csv(**context):
 
                 if "bioEvent" in cols:
                     update_map["bioEvent"] = new_bio
-
                 if "website" in cols and (old_website is None and website is not None):
                     update_map["website"] = website
 
@@ -360,27 +360,21 @@ def upsert_events_from_csv(**context):
                 if "codePostal" in cols and code_postal:
                     update_map["codePostal"] = code_postal
 
-                # ✅ youtube
                 if "youtube_query" in cols and youtube_query:
                     update_map["youtube_query"] = youtube_query
-                if "youtube_short" in cols and youtube_short:
-                    update_map["youtube_short"] = youtube_short
-                # colonne optionnelle
                 if "youtube_video" in cols and youtube_video:
                     update_map["youtube_video"] = youtube_video
 
-                # tiktok / insta
                 if "tiktok_query" in cols and tiktok_query:
                     update_map["tiktok_query"] = tiktok_query
                 if "tiktok_video" in cols and tiktok_video:
                     update_map["tiktok_video"] = tiktok_video
+
                 if "instagram_query" in cols and instagram_query:
                     update_map["instagram_query"] = instagram_query
                 if "instagram_reel" in cols and instagram_reel:
                     update_map["instagram_reel"] = instagram_reel
 
-                if "price" in cols and price:
-                    update_map["price"] = price
                 if "category" in cols and category:
                     update_map["category"] = category
 
@@ -390,17 +384,15 @@ def upsert_events_from_csv(**context):
                 updated += 1
                 continue
 
-            # insert new
+            # INSERT
             bio_event = _build_bio(
                 "",
                 category=category,
-                price=price,
                 website=website,
                 youtube_query=youtube_query,
-                youtube_short=youtube_short,
-                youtube_video=youtube_video,
+                youtube_video_json=youtube_video,
                 tiktok_query=tiktok_query,
-                tiktok_video=tiktok_video,
+                tiktok_video_json=tiktok_video,
                 instagram_query=instagram_query,
                 instagram_reel=instagram_reel,
             )
@@ -445,26 +437,21 @@ def upsert_events_from_csv(**context):
             if "lon" in cols and lon is not None:
                 insert_map["lon"] = float(lon)
 
-            # ✅ youtube
             if "youtube_query" in cols:
                 insert_map["youtube_query"] = youtube_query
             if "youtube_video" in cols:
-                insert_map["youtube_short"] = youtube_short
-            if "youtube_video" in cols:
                 insert_map["youtube_video"] = youtube_video
 
-            # tiktok / insta
             if "tiktok_query" in cols:
                 insert_map["tiktok_query"] = tiktok_query
             if "tiktok_video" in cols:
                 insert_map["tiktok_video"] = tiktok_video
+
             if "instagram_query" in cols:
                 insert_map["instagram_query"] = instagram_query
             if "instagram_reel" in cols:
                 insert_map["instagram_reel"] = instagram_reel
 
-            if "price" in cols:
-                insert_map["price"] = price
             if "category" in cols:
                 insert_map["category"] = category
 
@@ -486,9 +473,6 @@ def upsert_events_from_csv(**context):
         connection.close()
 
 
-# ---------------------------------------------------------------------
-# DAG
-# ---------------------------------------------------------------------
 default_args = {
     "owner": "airflow",
     "retries": 1,
@@ -503,9 +487,9 @@ with DAG(
     default_args=default_args,
     tags=["event", "import", "tiktok", "youtube", "instagram", "playwright"],
     params={
-        "do_youtube": Param(True, type="boolean", title="Inclure YouTube", description="Scraper YouTube Shorts"),
-        "do_tiktok": Param(True, type="boolean", title="Inclure TikTok", description="Scraper TikTok"),
-        "do_instagram": Param(True, type="boolean", title="Inclure Instagram", description="Scraper Instagram (best effort, sans login)"),
+        "do_youtube": Param(True, type="boolean", title="Inclure YouTube", description="Scraper YouTube Shorts -> youtube_video (JSON list)"),
+        "do_tiktok": Param(True, type="boolean", title="Inclure TikTok", description="Scraper TikTok -> tiktok_video (JSON list)"),
+        "do_instagram": Param(True, type="boolean", title="Inclure Instagram", description="Scraper Instagram (best effort)"),
         "debug_limit_rows": Param(5, type=["integer", "null"], title="Debug limit rows", description="Nombre max de lignes (null = tout)"),
     },
 ) as dag:
@@ -518,17 +502,13 @@ with DAG(
         provide_context=True,
         params={
             "root_folder": "/opt/airflow/data",
-
             "name_col": "OSrXXb",
             "address_col": "rllt__details 3",
             "website_col": "MRe4xd href",
-
             "headless": True,
             "tt_state_path": "/opt/airflow/data/tt_state.json",
-
             "do_geocode": True,
             "geocode_cache": "/opt/airflow/data/geocode_cache.csv",
-
             "output_dir": "/opt/airflow/data",
         },
     )
@@ -541,10 +521,8 @@ with DAG(
             "name_col": "OSrXXb",
             "address_col": "rllt__details 3",
             "website_col": "MRe4xd href",
-
             "use_category_as_region": True,
             "region_default": "Paris",
-
             "creator_winker_id": 116,
             "active_default": 0,
             "max_participants": 99999999,
