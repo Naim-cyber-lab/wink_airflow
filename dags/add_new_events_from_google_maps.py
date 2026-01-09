@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -30,21 +31,13 @@ DAG_DOC = r"""
 
 - Charge tous les `google.xlsx` / `google (n).xlsx` dans les sous-dossiers de `root_folder`
 - Enrichit avec:
-  - youtube_query, youtube_short
+  - youtube_query, youtube_short, youtube_shorts (liste JSON)
   - tiktok_query, tiktok_video
   - instagram_query, instagram_reel
   - latitude/longitude (via geocode)
 - Upsert dans `profil_event`
-
-## Debug rapide
-- `debug_limit_rows: 5` => limite le dataframe à 5 lignes AVANT Playwright + geocode.
-- Pour revenir au normal: mets `debug_limit_rows: null`.
 """
 
-
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
 POSTAL_RE = re.compile(r"\b(\d{5})\b")
 
 
@@ -87,6 +80,20 @@ def _get_table_columns(cursor, table: str) -> set[str]:
     return {r[0] for r in cursor.fetchall()}
 
 
+def _format_youtube_shorts_for_bio(youtube_shorts_json: str | None) -> str | None:
+    if not youtube_shorts_json:
+        return None
+    try:
+        arr = json.loads(youtube_shorts_json)
+        if not isinstance(arr, list) or not arr:
+            return None
+        # 1 par ligne
+        return "\n".join([f"- {u}" for u in arr[:10] if isinstance(u, str) and u.strip()])
+    except Exception:
+        # si c'est déjà du texte, on le garde tel quel
+        return youtube_shorts_json
+
+
 def _build_bio(
     old_bio: str,
     *,
@@ -95,15 +102,12 @@ def _build_bio(
     website: str | None,
     youtube_query: str | None,
     youtube_short: str | None,
+    youtube_shorts: str | None,
     tiktok_query: str | None,
     tiktok_video: str | None,
     instagram_query: str | None,
     instagram_reel: str | None,
 ) -> str:
-    """
-    On met TOUT ce qui est enrichissement dans bioEvent,
-    même si on a aussi des colonnes dédiées.
-    """
     base = safe_str(old_bio)
     lines = [base] if base else []
 
@@ -118,10 +122,23 @@ def _build_bio(
     add_line("Category", category)
     add_line("Price", price)
     add_line("Website", website)
+
     add_line("YouTube query", youtube_query)
-    add_line("YouTube Shorts", youtube_short)
+    add_line("YouTube Shorts (first)", youtube_short)
+
+    yt_list = _format_youtube_shorts_for_bio(youtube_shorts)
+    if yt_list:
+        # bloc multi-lignes
+        block_header = "YouTube Shorts (list):"
+        if block_header not in base:
+            lines.append(block_header)
+        for ln in yt_list.splitlines():
+            if ln and ln not in base:
+                lines.append(ln)
+
     add_line("TikTok query", tiktok_query)
     add_line("TikTok", tiktok_video)
+
     add_line("Instagram query", instagram_query)
     add_line("Instagram Reel", instagram_reel)
 
@@ -159,26 +176,21 @@ def _exec_update(cursor, table: str, event_id: int, data: dict[str, object]):
 def enrich_and_export_csv(**context):
     params = context["params"]
 
-    # Root folder (celui qui marche chez toi)
     root_folder = params["root_folder"]
     name_col = params["name_col"]
     address_col = params["address_col"]
 
-    # Playwright
     headless = bool(params.get("headless", True))
     tt_state_path = params.get("tt_state_path")
 
-    # Social flags (DAG Params visibles dans Trigger DAG)
+    # DAG params (UI Trigger)
     do_youtube = bool(params.get("do_youtube", True))
     do_tiktok = bool(params.get("do_tiktok", True))
     do_instagram = bool(params.get("do_instagram", True))
+    debug_limit_rows = params.get("debug_limit_rows", 5)  # None => full
 
-    # Geocode
     do_geocode = bool(params.get("do_geocode", True))
     geocode_cache = params.get("geocode_cache", "/opt/airflow/data/geocode_cache.csv")
-
-    # Debug (DAG Param visible)
-    debug_limit_rows = params.get("debug_limit_rows", 5)  # None/null => full
 
     output_dir = params.get("output_dir", "/opt/airflow/data")
     os.makedirs(output_dir, exist_ok=True)
@@ -210,6 +222,7 @@ def enrich_and_export_csv(**context):
         "longitude",
         "youtube_query",
         "youtube_short",
+        "youtube_shorts",
         "tiktok_query",
         "tiktok_video",
         "instagram_query",
@@ -234,7 +247,6 @@ def upsert_events_from_csv(**context):
     address_col = params["address_col"]
     website_col = params.get("website_col", "MRe4xd href")
 
-    # IMPORTANT: region = category par défaut
     region_default = params.get("region_default", "Paris")
     use_category_as_region = bool(params.get("use_category_as_region", True))
 
@@ -288,15 +300,18 @@ def upsert_events_from_csv(**context):
 
             youtube_query = safe_str(row.get("youtube_query")) or None
             youtube_short = safe_str(row.get("youtube_short")) or None
+            youtube_shorts = safe_str(row.get("youtube_shorts")) or None
+
             tiktok_query = safe_str(row.get("tiktok_query")) or None
             tiktok_video = safe_str(row.get("tiktok_video")) or None
+
             instagram_query = safe_str(row.get("instagram_query")) or None
             instagram_reel = safe_str(row.get("instagram_reel")) or None
 
             lat = row.get("latitude", None)
             lon = row.get("longitude", None)
 
-            # 1) existing?
+            # existing?
             cursor.execute(
                 """
                 SELECT id, "bioEvent", website, lat, lon
@@ -318,6 +333,7 @@ def upsert_events_from_csv(**context):
                     website=website or old_website,
                     youtube_query=youtube_query,
                     youtube_short=youtube_short,
+                    youtube_shorts=youtube_shorts,
                     tiktok_query=tiktok_query,
                     tiktok_video=tiktok_video,
                     instagram_query=instagram_query,
@@ -329,17 +345,14 @@ def upsert_events_from_csv(**context):
                 if "bioEvent" in cols:
                     update_map["bioEvent"] = new_bio
 
-                # website: fill if missing
                 if "website" in cols and (old_website is None and website is not None):
                     update_map["website"] = website
 
-                # lat/lon: fill if missing
                 if "lat" in cols and old_lat is None and lat is not None:
                     update_map["lat"] = float(lat)
                 if "lon" in cols and old_lon is None and lon is not None:
                     update_map["lon"] = float(lon)
 
-                # region/city/codePostal
                 if "region" in cols:
                     update_map["region"] = region
                 if "city" in cols:
@@ -347,16 +360,20 @@ def upsert_events_from_csv(**context):
                 if "codePostal" in cols and code_postal:
                     update_map["codePostal"] = code_postal
 
-                # enrich columns if exist
+                # ✅ youtube
                 if "youtube_query" in cols and youtube_query:
                     update_map["youtube_query"] = youtube_query
                 if "youtube_short" in cols and youtube_short:
                     update_map["youtube_short"] = youtube_short
+                # colonne optionnelle
+                if "youtube_shorts" in cols and youtube_shorts:
+                    update_map["youtube_shorts"] = youtube_shorts
+
+                # tiktok / insta
                 if "tiktok_query" in cols and tiktok_query:
                     update_map["tiktok_query"] = tiktok_query
                 if "tiktok_video" in cols and tiktok_video:
                     update_map["tiktok_video"] = tiktok_video
-
                 if "instagram_query" in cols and instagram_query:
                     update_map["instagram_query"] = instagram_query
                 if "instagram_reel" in cols and instagram_reel:
@@ -373,7 +390,7 @@ def upsert_events_from_csv(**context):
                 updated += 1
                 continue
 
-            # 2) insert new
+            # insert new
             bio_event = _build_bio(
                 "",
                 category=category,
@@ -381,6 +398,7 @@ def upsert_events_from_csv(**context):
                 website=website,
                 youtube_query=youtube_query,
                 youtube_short=youtube_short,
+                youtube_shorts=youtube_shorts,
                 tiktok_query=tiktok_query,
                 tiktok_video=tiktok_video,
                 instagram_query=instagram_query,
@@ -389,7 +407,6 @@ def upsert_events_from_csv(**context):
 
             insert_map: dict[str, object] = {}
 
-            # core
             if "titre" in cols:
                 insert_map["titre"] = titre
             if "titre_fr" in cols:
@@ -409,11 +426,9 @@ def upsert_events_from_csv(**context):
             if "website" in cols:
                 insert_map["website"] = website
 
-            # required/not null
             if "nbStories" in cols:
                 insert_map["nbStories"] = 0
 
-            # creator / flags
             if "creatorWinker_id" in cols:
                 insert_map["creatorWinker_id"] = creator_winker_id
             if "active" in cols:
@@ -425,22 +440,24 @@ def upsert_events_from_csv(**context):
             if "validated_from_web" in cols:
                 insert_map["validated_from_web"] = validated_from_web
 
-            # lat/lon
             if "lat" in cols and lat is not None:
                 insert_map["lat"] = float(lat)
             if "lon" in cols and lon is not None:
                 insert_map["lon"] = float(lon)
 
-            # enrich columns if exist
+            # ✅ youtube
             if "youtube_query" in cols:
                 insert_map["youtube_query"] = youtube_query
             if "youtube_short" in cols:
                 insert_map["youtube_short"] = youtube_short
+            if "youtube_shorts" in cols:
+                insert_map["youtube_shorts"] = youtube_shorts
+
+            # tiktok / insta
             if "tiktok_query" in cols:
                 insert_map["tiktok_query"] = tiktok_query
             if "tiktok_video" in cols:
                 insert_map["tiktok_video"] = tiktok_video
-
             if "instagram_query" in cols:
                 insert_map["instagram_query"] = instagram_query
             if "instagram_reel" in cols:
@@ -485,33 +502,11 @@ with DAG(
     catchup=False,
     default_args=default_args,
     tags=["event", "import", "tiktok", "youtube", "instagram", "playwright"],
-
-    # ✅ Params AU NIVEAU DU DAG => visibles dans Trigger DAG (UI)
     params={
-        "do_youtube": Param(
-            True,
-            type="boolean",
-            title="Inclure YouTube",
-            description="Scraper YouTube Shorts",
-        ),
-        "do_tiktok": Param(
-            True,
-            type="boolean",
-            title="Inclure TikTok",
-            description="Scraper TikTok",
-        ),
-        "do_instagram": Param(
-            True,
-            type="boolean",
-            title="Inclure Instagram",
-            description="Scraper Instagram (best effort, sans login)",
-        ),
-        "debug_limit_rows": Param(
-            5,
-            type=["integer", "null"],
-            title="Debug limit rows",
-            description="Nombre max de lignes (null = tout)",
-        ),
+        "do_youtube": Param(True, type="boolean", title="Inclure YouTube", description="Scraper YouTube Shorts"),
+        "do_tiktok": Param(True, type="boolean", title="Inclure TikTok", description="Scraper TikTok"),
+        "do_instagram": Param(True, type="boolean", title="Inclure Instagram", description="Scraper Instagram (best effort, sans login)"),
+        "debug_limit_rows": Param(5, type=["integer", "null"], title="Debug limit rows", description="Nombre max de lignes (null = tout)"),
     },
 ) as dag:
     dag.doc_md = DAG_DOC
@@ -522,27 +517,19 @@ with DAG(
         python_callable=enrich_and_export_csv,
         provide_context=True,
         params={
-            # on garde ton chemin qui marche
             "root_folder": "/opt/airflow/data",
 
             "name_col": "OSrXXb",
             "address_col": "rllt__details 3",
             "website_col": "MRe4xd href",
 
-            # Playwright
             "headless": True,
             "tt_state_path": "/opt/airflow/data/tt_state.json",
 
-            # Geocode
             "do_geocode": True,
             "geocode_cache": "/opt/airflow/data/geocode_cache.csv",
 
             "output_dir": "/opt/airflow/data",
-
-            # ⚠️ IMPORTANT:
-            # PAS de do_youtube / do_tiktok / do_instagram ici,
-            # sinon tu écrases les choix faits dans Trigger DAG.
-            # PAS de debug_limit_rows ici non plus (il est au niveau DAG).
         },
     )
 
@@ -555,7 +542,6 @@ with DAG(
             "address_col": "rllt__details 3",
             "website_col": "MRe4xd href",
 
-            # region = category par défaut
             "use_category_as_region": True,
             "region_default": "Paris",
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -23,6 +24,8 @@ except Exception:
     Nominatim = None
     RateLimiter = None
 
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 # ============================================================
 # Utils
@@ -146,8 +149,8 @@ def load_all_google_excels(
     df_all = df_all.drop_duplicates(subset=["row_id"], keep="first").reset_index(drop=True)
     after = len(df_all)
 
-    logging.info(f"[load] Déduplication: {before} -> {after} lignes (supprimé {before-after})")
-    logging.info(f"[load] Clés utilisées pour row_id: {existing_key_cols}")
+    logging.info("[load] Déduplication: %s -> %s lignes (supprimé %s)", before, after, before - after)
+    logging.info("[load] Clés utilisées pour row_id: %s", existing_key_cols)
 
     return df_all
 
@@ -175,7 +178,6 @@ def add_lat_lng(
     if address_col not in df.columns:
         raise ValueError(f"address_col='{address_col}' introuvable dans le dataframe.")
 
-    # normalisation (Paris/France) pour avoir des coords cohérentes
     def normalize(a: str) -> str:
         a = safe_str(a)
         if not a or a.lower() == "nan":
@@ -249,32 +251,86 @@ def add_lat_lng(
 
 
 # ============================================================
-# 3) YouTube shorts
+# 3) YouTube Shorts (✅ robust + liste)
 # ============================================================
 
-@dataclass
-class Place:
-    name: str
-    address: str
-    youtube_short_url: str | None = None
+YOUTUBE_SHORTS_URL_RE = re.compile(r"^https?://(www\.)?youtube\.com/shorts/[^/?#]+", re.IGNORECASE)
 
 
-async def find_youtube_short(page, place: Place) -> Place:
-    query = quote_plus(f"{place.name} {place.address} youtube shorts")
-    url = f"https://www.youtube.com/results?search_query={query}"
+async def _handle_youtube_consent_best_effort(page) -> None:
+    """
+    Best effort : clique si un bouton cookie est présent.
+    Ne doit jamais faire planter le scraping.
+    """
+    candidates = [
+        "button:has-text('Tout accepter')",
+        "button:has-text('J’accepte')",
+        "button:has-text('Accepter tout')",
+        "button:has-text('I agree')",
+        "button:has-text('Accept all')",
+        "button:has-text('Tout refuser')",
+        "button:has-text('Reject all')",
+    ]
+    for _ in range(2):
+        clicked = False
+        for sel in candidates:
+            try:
+                btn = await page.query_selector(sel)
+                if btn:
+                    await btn.click()
+                    await page.wait_for_timeout(1200)
+                    clicked = True
+                    break
+            except Exception:
+                pass
+        if not clicked:
+            break
+
+
+async def find_youtube_shorts_list(
+    page,
+    query: str,
+    *,
+    max_results: int = 5,
+    scroll_steps: int = 6,
+) -> list[str]:
+    """
+    Retourne une liste de liens YouTube Shorts (max_results).
+    Stratégie robuste :
+    - aller sur results
+    - gérer consent best effort
+    - scroll un peu
+    - récupérer a[href*="/shorts/"] dans le DOM
+    """
+    url = "https://www.youtube.com/results?search_query=" + quote_plus(query)
     await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    await page.wait_for_timeout(2000)
 
-    await page.wait_for_timeout(1200)
+    await _handle_youtube_consent_best_effort(page)
 
-    anchors = await page.query_selector_all("a#video-title")
-    for a in anchors[:30]:
+    for _ in range(scroll_steps):
+        try:
+            await page.mouse.wheel(0, 1600)
+        except Exception:
+            pass
+        await page.wait_for_timeout(700)
+
+    anchors = await page.query_selector_all("a[href*='/shorts/']")
+    results: list[str] = []
+    for a in anchors:
         href = await a.get_attribute("href")
         if not href:
             continue
-        if "/shorts/" in href:
-            place.youtube_short_url = href if href.startswith("http") else f"https://www.youtube.com{href}"
-            return place
-    return place
+        if href.startswith("/"):
+            href = "https://www.youtube.com" + href
+        # normalize a bit
+        href = href.split("&")[0]
+        if YOUTUBE_SHORTS_URL_RE.match(href) and href not in results:
+            results.append(href)
+        if len(results) >= max_results:
+            break
+
+    return results
 
 
 async def add_youtube_shorts_to_df(
@@ -282,14 +338,26 @@ async def add_youtube_shorts_to_df(
     name_col: str,
     address_col: str,
     headless: bool = True,
+    max_results: int = 5,
 ) -> pd.DataFrame:
+    """
+    Ajoute:
+      - youtube_query (str)
+      - youtube_short (str) => premier short (compat DB)
+      - youtube_shorts (str JSON) => liste complète (max_results)
+    """
     df = df.copy()
-    df["youtube_query"] = None
+    if "youtube_query" not in df.columns:
+        df["youtube_query"] = None
     df["youtube_short"] = None
+    df["youtube_shorts"] = None
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
-        context = await browser.new_context()
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 720},
+            locale="fr-FR",
+        )
         page = await context.new_page()
 
         for i, row in df.iterrows():
@@ -299,10 +367,13 @@ async def add_youtube_shorts_to_df(
             df.at[i, "youtube_query"] = query
 
             try:
-                updated = await find_youtube_short(page, Place(name=name, address=address))
-                df.at[i, "youtube_short"] = updated.youtube_short_url
-            except Exception:
+                shorts = await find_youtube_shorts_list(page, query, max_results=max_results)
+                df.at[i, "youtube_short"] = shorts[0] if shorts else None
+                df.at[i, "youtube_shorts"] = json.dumps(shorts, ensure_ascii=False) if shorts else None
+            except Exception as e:
+                logging.warning("[youtube] failed for query=%r err=%s", query, e)
                 df.at[i, "youtube_short"] = None
+                df.at[i, "youtube_shorts"] = None
 
         await context.close()
         await browser.close()
@@ -423,11 +494,6 @@ def _duckduckgo_html_search(query: str, timeout: int = 20) -> str:
 
 
 def find_instagram_reel_link(query: str) -> str | None:
-    """
-    Best effort:
-    - cherche un lien instagram reel dans le HTML DuckDuckGo.
-    - Pas de Playwright, pas de login.
-    """
     try:
         html = _duckduckgo_html_search(f"site:instagram.com/reel {query}")
     except (HTTPError, URLError, TimeoutError, Exception):
@@ -477,14 +543,13 @@ async def run_pipeline(
     geocode_cache: str = "geocode_cache.csv",
     tt_state_path: str = "tt_state.json",
     headless: bool = True,
-    debug_limit_rows: int | None = None,   # debug
+    debug_limit_rows: int | None = None,
     do_youtube: bool = True,
     do_tiktok: bool = True,
     do_instagram: bool = True,
 ) -> pd.DataFrame:
     df = load_all_google_excels(root_folder=root_folder)
 
-    # debug limit AVANT geocode + playwright
     if debug_limit_rows is not None:
         df = df.head(int(debug_limit_rows)).copy()
         logging.warning("🧪 [debug] Limitation DataFrame à %s lignes (debug_limit_rows=%s)", len(df), debug_limit_rows)
@@ -492,13 +557,23 @@ async def run_pipeline(
     if do_geocode:
         df = add_lat_lng(df, address_col=address_col, cache_path=geocode_cache)
 
-    # Colonnes stables même si on skip une plateforme
-    for c in ["youtube_query", "youtube_short", "tiktok_query", "tiktok_video", "instagram_query", "instagram_reel"]:
+    # Colonnes stables
+    for c in [
+        "youtube_query", "youtube_short", "youtube_shorts",
+        "tiktok_query", "tiktok_video",
+        "instagram_query", "instagram_reel"
+    ]:
         if c not in df.columns:
             df[c] = None
 
     if do_youtube:
-        df = await add_youtube_shorts_to_df(df, name_col=name_col, address_col=address_col, headless=headless)
+        df = await add_youtube_shorts_to_df(
+            df,
+            name_col=name_col,
+            address_col=address_col,
+            headless=headless,
+            max_results=5,
+        )
 
     if do_tiktok:
         df = await add_tiktok_videos_to_df(
@@ -527,7 +602,6 @@ def main():
     parser.add_argument("--debug-limit-rows", type=int, default=None, help="Limit rows before enrichment")
     parser.add_argument("--out", default="enriched.csv", help="Output CSV path")
 
-    # flags de désactivation (par défaut tout est ON)
     parser.add_argument("--no-youtube", action="store_true", help="Disable YouTube enrichment")
     parser.add_argument("--no-tiktok", action="store_true", help="Disable TikTok enrichment")
     parser.add_argument("--no-instagram", action="store_true", help="Disable Instagram enrichment")
