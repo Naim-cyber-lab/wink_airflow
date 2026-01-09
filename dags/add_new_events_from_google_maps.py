@@ -17,7 +17,8 @@ from airflow.hooks.base import BaseHook
 from airflow.operators.python import PythonOperator
 from airflow.utils.dates import days_ago
 
-from social_enricher import run_pipeline
+from social_enricher import run_pipeline  # type: ignore
+
 
 PARIS_TZ = ZoneInfo("Europe/Paris")
 DB_CONN_ID = "my_postgres"
@@ -25,7 +26,7 @@ DB_CONN_ID = "my_postgres"
 DAG_DOC = r"""
 # 🎬 Import Events depuis Google Excels + enrichissement TikTok/YouTube/Instagram
 
-- Charge tous les `google*.xlsx` dans les sous-dossiers de `root_folder`
+- Charge tous les `google.xlsx` / `google (n).xlsx` dans les sous-dossiers de `root_folder`
 - Enrichit avec:
   - youtube_query, youtube_short
   - tiktok_query, tiktok_video
@@ -33,47 +34,40 @@ DAG_DOC = r"""
   - latitude/longitude (via geocode)
 - Upsert dans `profil_event`
 
-## Debug
-- `debug_limit_rows: 5` => limite le dataframe à 5 lignes AVANT Playwright + geocode
+## Debug rapide
+- `debug_limit_rows: 5` => limite le dataframe à 5 lignes AVANT Playwright + geocode.
+- Pour revenir au normal: mets `debug_limit_rows: None`.
 """
 
 
 # ---------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------
-def get_conn():
-    conn = BaseHook.get_connection(DB_CONN_ID)
-    return psycopg2.connect(
-        host=conn.host,
-        port=conn.port,
-        dbname=conn.schema,
-        user=conn.login,
-        password=conn.password,
-    )
+POSTAL_RE = re.compile(r"\b(\d{5})\b")
 
 
-def _slugify(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = re.sub(r"\s+", "-", s)
-    s = re.sub(r"[^a-z0-9\-]", "", s)
-    return s[:120] if s else ""
+def safe_str(x) -> str:
+    if x is None:
+        return ""
+    try:
+        if pd.isna(x):
+            return ""
+    except Exception:
+        pass
+    return str(x).strip()
 
 
-def _safe_bool(v) -> bool:
-    if isinstance(v, bool):
-        return v
-    if v is None:
-        return False
-    if isinstance(v, (int, float)):
-        return bool(v)
-    s = str(v).strip().lower()
-    return s in {"1", "true", "yes", "y", "on"}
+def extract_postal_code(address: str) -> str | None:
+    if not address:
+        return None
+    m = POSTAL_RE.search(address)
+    return m.group(1) if m else None
 
 
-def _normalize_region_from_address(address: str) -> str | None:
-    a = (address or "").lower()
-    if "lille" in a:
-        return "Lille"
+def guess_city(address: str) -> str | None:
+    if not address:
+        return None
+    a = address.lower()
     if "paris" in a:
         return "Paris"
     return None
@@ -91,80 +85,70 @@ def _get_table_columns(cursor, table: str) -> set[str]:
     return {r[0] for r in cursor.fetchall()}
 
 
-def _upsert_events(df: pd.DataFrame, table: str = "profil_event"):
+def _build_bio(
+    old_bio: str,
+    *,
+    category: str | None,
+    price: str | None,
+    website: str | None,
+    youtube_query: str | None,
+    youtube_short: str | None,
+    tiktok_query: str | None,
+    tiktok_video: str | None,
+    instagram_query: str | None,
+    instagram_reel: str | None,
+) -> str:
     """
-    Upsert on (title, address) if those columns exist; fallback to (title) otherwise.
-    This script tries to be resilient to schema changes by only inserting columns
-    that exist in the DB table.
+    On met TOUT ce qui est enrichissement dans bioEvent,
+    même si on a aussi des colonnes dédiées.
     """
-    if df.empty:
-        logging.warning("⚠️ [db] DataFrame empty => nothing to upsert.")
-        return
+    base = safe_str(old_bio)
+    lines = [base] if base else []
 
-    conn = get_conn()
-    conn.autocommit = False
+    def add_line(label: str, value: str | None):
+        v = safe_str(value)
+        if not v:
+            return
+        line = f"{label}: {v}"
+        if line not in base:
+            lines.append(line)
 
-    try:
-        with conn.cursor() as cur:
-            table_cols = _get_table_columns(cur, table)
+    add_line("Category", category)
+    add_line("Price", price)
+    add_line("Website", website)
+    add_line("YouTube query", youtube_query)
+    add_line("YouTube Shorts", youtube_short)
+    add_line("TikTok query", tiktok_query)
+    add_line("TikTok", tiktok_video)
+    add_line("Instagram query", instagram_query)
+    add_line("Instagram Reel", instagram_reel)
 
-            # keep only columns existing in DB
-            keep_cols = [c for c in df.columns if c in table_cols]
-            if not keep_cols:
-                raise RuntimeError(f"No matching columns between DF and DB table {table}")
+    return "\n".join([l for l in lines if l]).strip()
 
-            df2 = df[keep_cols].copy()
 
-            # Determine conflict keys
-            conflict_cols = []
-            if "title" in table_cols:
-                conflict_cols.append("title")
-            if "address" in table_cols and "address" in df2.columns:
-                conflict_cols.append("address")
+def _exec_insert(cursor, table: str, data: dict[str, object]):
+    cols = [sql.Identifier(c) for c in data.keys()]
+    placeholders = [sql.Placeholder() for _ in data.keys()]
+    query = sql.SQL("INSERT INTO {t} ({cols}) VALUES ({vals}) RETURNING id").format(
+        t=sql.Identifier(table),
+        cols=sql.SQL(", ").join(cols),
+        vals=sql.SQL(", ").join(placeholders),
+    )
+    cursor.execute(query, list(data.values()))
+    return cursor.fetchone()[0]
 
-            if not conflict_cols:
-                raise RuntimeError("Cannot determine upsert conflict keys (need at least 'title').")
 
-            # Build INSERT ... ON CONFLICT
-            cols_sql = sql.SQL(", ").join(map(sql.Identifier, keep_cols))
-            placeholders = sql.SQL(", ").join(sql.Placeholder() * len(keep_cols))
-
-            update_cols = [c for c in keep_cols if c not in conflict_cols]
-            update_sql = sql.SQL(", ").join(
-                sql.SQL("{} = EXCLUDED.{}").format(sql.Identifier(c), sql.Identifier(c))
-                for c in update_cols
-            )
-
-            query = sql.SQL(
-                """
-                INSERT INTO {table} ({cols})
-                VALUES ({vals})
-                ON CONFLICT ({conflict})
-                DO UPDATE SET {updates}
-                """
-            ).format(
-                table=sql.Identifier(table),
-                cols=cols_sql,
-                vals=placeholders,
-                conflict=sql.SQL(", ").join(map(sql.Identifier, conflict_cols)),
-                updates=update_sql if update_cols else sql.SQL("title = EXCLUDED.title"),
-            )
-
-            rows = df2.to_dict(orient="records")
-            logging.info("💾 [db] Upserting %s rows into %s", len(rows), table)
-
-            for r in rows:
-                values = [r.get(c) for c in keep_cols]
-                cur.execute(query, values)
-
-        conn.commit()
-
-    except Exception:
-        conn.rollback()
-        raise
-
-    finally:
-        conn.close()
+def _exec_update(cursor, table: str, event_id: int, data: dict[str, object]):
+    assignments = [
+        sql.SQL("{} = {}").format(sql.Identifier(k), sql.Placeholder())
+        for k in data.keys()
+    ]
+    query = sql.SQL("UPDATE {t} SET {assignments} WHERE id = %s").format(
+        t=sql.Identifier(table),
+        assignments=sql.SQL(", ").join(assignments),
+    )
+    values = list(data.values()) + [event_id]
+    cursor.execute(query, values)
 
 
 # ---------------------------------------------------------------------
@@ -173,24 +157,23 @@ def _upsert_events(df: pd.DataFrame, table: str = "profil_event"):
 def enrich_and_export_csv(**context):
     params = context["params"]
 
+    # ✅ On garde ton root_folder (celui qui marchait)
     root_folder = params["root_folder"]
     name_col = params["name_col"]
     address_col = params["address_col"]
 
     # Playwright
     headless = bool(params.get("headless", True))
+    tt_state_path = params.get("tt_state_path")
 
-    # Social flags (from Trigger DAG params)
+    # Social flags (Trigger DAG)
     do_youtube = bool(params.get("do_youtube", True))
     do_tiktok = bool(params.get("do_tiktok", True))
-    do_instagram = bool(params.get("do_instagram", False))
+    do_instagram = bool(params.get("do_instagram", True))
 
-    # geocode
+    # Geocode
     do_geocode = bool(params.get("do_geocode", True))
     geocode_cache = params.get("geocode_cache", "/opt/airflow/data/geocode_cache.csv")
-
-    # TikTok state
-    tt_state_path = params.get("tt_state_path", "/opt/airflow/data/tt_state.json")
 
     # 🧪 Debug
     debug_limit_rows = params.get("debug_limit_rows", 5)  # mets None pour full
@@ -216,12 +199,11 @@ def enrich_and_export_csv(**context):
         )
     )
 
-    # colonnes minimales attendues
+    # colonnes minimales attendues (pour CSV stable)
     for col in [
         "category",
-        "title",
-        "address",
-        "region",
+        "source_folder",
+        "source_file",
         "latitude",
         "longitude",
         "youtube_query",
@@ -234,96 +216,257 @@ def enrich_and_export_csv(**context):
         if col not in df.columns:
             df[col] = None
 
-    # region: fallback
-    use_category_as_region = bool(params.get("use_category_as_region", True))
+    df.to_csv(out_csv, index=False)
+    logging.info("✅ [enrich] Exported: %s | rows=%s", out_csv, len(df))
+
+    context["ti"].xcom_push(key="enriched_csv_path", value=out_csv)
+
+
+# ---------------------------------------------------------------------
+# Task 2: upsert
+# ---------------------------------------------------------------------
+def upsert_events_from_csv(**context):
+    params = context["params"]
+
+    name_col = params["name_col"]
+    address_col = params["address_col"]
+    website_col = params.get("website_col", "MRe4xd href")
+
+    # ✅ IMPORTANT: region = category (dossier) par défaut
     region_default = params.get("region_default", "Paris")
+    use_category_as_region = bool(params.get("use_category_as_region", True))
 
-    if "region" in df.columns:
-        for i, row in df.iterrows():
-            if row.get("region"):
-                continue
-
-            addr = str(row.get("address", "") or "")
-            reg = _normalize_region_from_address(addr)
-
-            if reg:
-                df.at[i, "region"] = reg
-            elif use_category_as_region and row.get("category"):
-                df.at[i, "region"] = row.get("category")
-            else:
-                df.at[i, "region"] = region_default
-
-    # champs event (defaults)
     creator_winker_id = int(params.get("creator_winker_id", 116))
     active_default = int(params.get("active_default", 0))
     max_participants = int(params.get("max_participants", 99999999))
-    access_comment = _safe_bool(params.get("access_comment", True))
-    validated_from_web = _safe_bool(params.get("validated_from_web", False))
+    access_comment = bool(params.get("access_comment", True))
+    validated_from_web = bool(params.get("validated_from_web", False))
 
-    # mapping vers DB si les colonnes existent
-    if "creator_winker_id" not in df.columns:
-        df["creator_winker_id"] = creator_winker_id
-    if "active" not in df.columns:
-        df["active"] = active_default
-    if "maxParticipants" not in df.columns:
-        df["maxParticipants"] = max_participants
-    if "accessComment" not in df.columns:
-        df["accessComment"] = access_comment
-    if "validatedFromWeb" not in df.columns:
-        df["validatedFromWeb"] = validated_from_web
+    ti = context["ti"]
+    csv_path = ti.xcom_pull(task_ids="enrich_and_export_csv", key="enriched_csv_path")
+    if not csv_path or not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Enriched CSV not found: {csv_path}")
 
-    # title/address normalization
-    if "title" not in df.columns:
-        df["title"] = df[name_col].astype(str).fillna("")
-    if "address" not in df.columns:
-        df["address"] = df[address_col].astype(str).fillna("")
+    df = pd.read_csv(csv_path)
+    logging.info("📥 [db] Loading CSV rows=%s from %s", len(df), csv_path)
 
-    # slug (if supported by db)
-    if "slug" not in df.columns:
-        df["slug"] = df["title"].apply(_slugify)
+    conn = BaseHook.get_connection(DB_CONN_ID)
+    connection = psycopg2.connect(
+        host=conn.host,
+        port=conn.port,
+        user=conn.login,
+        password=conn.password,
+        dbname=conn.schema,
+    )
+    cursor = connection.cursor()
 
-    # Put social links into bioEvent if exists
-    if "bioEvent" not in df.columns:
-        df["bioEvent"] = ""
+    inserted = 0
+    updated = 0
+    skipped = 0
 
-    for i, row in df.iterrows():
-        parts = []
-        if row.get("youtube_short"):
-            parts.append(f"YouTube: {row.get('youtube_short')}")
-        if row.get("tiktok_video"):
-            parts.append(f"TikTok: {row.get('tiktok_video')}")
-        if row.get("instagram_reel"):
-            parts.append(f"Instagram: {row.get('instagram_reel')}")
-        if parts:
-            cur = str(row.get("bioEvent") or "").strip()
-            if cur:
-                cur = cur + "\n" + "\n".join(parts)
-            else:
-                cur = "\n".join(parts)
-            df.at[i, "bioEvent"] = cur
+    try:
+        cols = _get_table_columns(cursor, "profil_event")
+        logging.info("🧱 [db] profil_event columns detected: %s cols", len(cols))
 
-    df.to_csv(out_csv, index=False)
-    logging.info("✅ [enrich] Saved enriched CSV to %s", out_csv)
+        for _, row in df.iterrows():
+            titre = safe_str(row.get(name_col))
+            adresse = safe_str(row.get(address_col))
+            if not titre or not adresse:
+                skipped += 1
+                continue
 
-    # push XCom
-    context["ti"].xcom_push(key="out_csv", value=out_csv)
+            category = safe_str(row.get("category")) or None
 
+            # ✅ region depuis category (bar paris / escape game paris / etc)
+            region = (category if (use_category_as_region and category) else safe_str(region_default)) or "Paris"
 
-# ---------------------------------------------------------------------
-# Task 2: load into DB
-# ---------------------------------------------------------------------
-def load_csv_to_db(**context):
-    params = context["params"]
-    table = params.get("table", "profil_event")
+            city = guess_city(adresse) or "Paris"
+            code_postal = extract_postal_code(adresse)
 
-    out_csv = context["ti"].xcom_pull(key="out_csv", task_ids="enrich_and_export_csv")
-    if not out_csv or not os.path.exists(out_csv):
-        raise FileNotFoundError(f"CSV not found: {out_csv}")
+            website = safe_str(row.get(website_col)) or None
+            price = safe_str(row.get("price")) or None
 
-    df = pd.read_csv(out_csv)
-    logging.info("📥 [db] Loaded CSV: %s rows", len(df))
-    _upsert_events(df, table=table)
-    logging.info("✅ [db] Upsert done.")
+            youtube_query = safe_str(row.get("youtube_query")) or None
+            youtube_short = safe_str(row.get("youtube_short")) or None
+            tiktok_query = safe_str(row.get("tiktok_query")) or None
+            tiktok_video = safe_str(row.get("tiktok_video")) or None
+            instagram_query = safe_str(row.get("instagram_query")) or None
+            instagram_reel = safe_str(row.get("instagram_reel")) or None
+
+            lat = row.get("latitude", None)
+            lon = row.get("longitude", None)
+
+            # 1) existing?
+            cursor.execute(
+                """
+                SELECT id, "bioEvent", website, lat, lon
+                FROM profil_event
+                WHERE titre = %s AND adresse = %s
+                LIMIT 1
+                """,
+                (titre, adresse),
+            )
+            existing = cursor.fetchone()
+
+            if existing:
+                event_id, old_bio, old_website, old_lat, old_lon = existing
+
+                new_bio = _build_bio(
+                    old_bio or "",
+                    category=category,
+                    price=price,
+                    website=website or old_website,
+                    youtube_query=youtube_query,
+                    youtube_short=youtube_short,
+                    tiktok_query=tiktok_query,
+                    tiktok_video=tiktok_video,
+                    instagram_query=instagram_query,
+                    instagram_reel=instagram_reel,
+                )
+
+                update_map: dict[str, object] = {}
+
+                if "bioEvent" in cols:
+                    update_map["bioEvent"] = new_bio
+
+                # website: fill if missing
+                if "website" in cols and (old_website is None and website is not None):
+                    update_map["website"] = website
+
+                # lat/lon: fill if missing
+                if "lat" in cols and old_lat is None and lat is not None:
+                    update_map["lat"] = float(lat)
+                if "lon" in cols and old_lon is None and lon is not None:
+                    update_map["lon"] = float(lon)
+
+                # region/city/codePostal
+                if "region" in cols:
+                    update_map["region"] = region
+                if "city" in cols:
+                    update_map["city"] = city
+                if "codePostal" in cols and code_postal:
+                    update_map["codePostal"] = code_postal
+
+                # enrich columns if exist
+                if "youtube_query" in cols and youtube_query:
+                    update_map["youtube_query"] = youtube_query
+                if "youtube_short" in cols and youtube_short:
+                    update_map["youtube_short"] = youtube_short
+                if "tiktok_query" in cols and tiktok_query:
+                    update_map["tiktok_query"] = tiktok_query
+                if "tiktok_video" in cols and tiktok_video:
+                    update_map["tiktok_video"] = tiktok_video
+
+                if "instagram_query" in cols and instagram_query:
+                    update_map["instagram_query"] = instagram_query
+                if "instagram_reel" in cols and instagram_reel:
+                    update_map["instagram_reel"] = instagram_reel
+
+                if "price" in cols and price:
+                    update_map["price"] = price
+                if "category" in cols and category:
+                    update_map["category"] = category
+
+                if update_map:
+                    _exec_update(cursor, "profil_event", int(event_id), update_map)
+
+                updated += 1
+                continue
+
+            # 2) insert new
+            bio_event = _build_bio(
+                "",
+                category=category,
+                price=price,
+                website=website,
+                youtube_query=youtube_query,
+                youtube_short=youtube_short,
+                tiktok_query=tiktok_query,
+                tiktok_video=tiktok_video,
+                instagram_query=instagram_query,
+                instagram_reel=instagram_reel,
+            )
+
+            insert_map: dict[str, object] = {}
+
+            # core
+            if "titre" in cols:
+                insert_map["titre"] = titre
+            if "titre_fr" in cols:
+                insert_map["titre_fr"] = titre
+            if "adresse" in cols:
+                insert_map["adresse"] = adresse
+
+            if "region" in cols:
+                insert_map["region"] = region
+            if "city" in cols:
+                insert_map["city"] = city
+            if "codePostal" in cols:
+                insert_map["codePostal"] = code_postal
+
+            if "bioEvent" in cols:
+                insert_map["bioEvent"] = bio_event
+            if "website" in cols:
+                insert_map["website"] = website
+
+            # required/not null
+            if "nbStories" in cols:
+                insert_map["nbStories"] = 0
+
+            # creator / flags
+            if "creatorWinker_id" in cols:
+                insert_map["creatorWinker_id"] = creator_winker_id
+            if "active" in cols:
+                insert_map["active"] = active_default
+            if "maxNumberParticipant" in cols:
+                insert_map["maxNumberParticipant"] = max_participants
+            if "accessComment" in cols:
+                insert_map["accessComment"] = access_comment
+            if "validated_from_web" in cols:
+                insert_map["validated_from_web"] = validated_from_web
+
+            # lat/lon
+            if "lat" in cols and lat is not None:
+                insert_map["lat"] = float(lat)
+            if "lon" in cols and lon is not None:
+                insert_map["lon"] = float(lon)
+
+            # enrich columns if exist
+            if "youtube_query" in cols:
+                insert_map["youtube_query"] = youtube_query
+            if "youtube_short" in cols:
+                insert_map["youtube_short"] = youtube_short
+            if "tiktok_query" in cols:
+                insert_map["tiktok_query"] = tiktok_query
+            if "tiktok_video" in cols:
+                insert_map["tiktok_video"] = tiktok_video
+
+            if "instagram_query" in cols:
+                insert_map["instagram_query"] = instagram_query
+            if "instagram_reel" in cols:
+                insert_map["instagram_reel"] = instagram_reel
+
+            if "price" in cols:
+                insert_map["price"] = price
+            if "category" in cols:
+                insert_map["category"] = category
+
+            if not insert_map:
+                raise RuntimeError("Aucune colonne détectée pour insert dans profil_event (schéma inattendu).")
+
+            _exec_insert(cursor, "profil_event", insert_map)
+            inserted += 1
+
+        connection.commit()
+        logging.info("✅ [db] Inserted=%s Updated=%s Skipped=%s", inserted, updated, skipped)
+
+    except Exception as e:
+        connection.rollback()
+        logging.error("❌ [db] Failure: %s", e)
+        raise
+    finally:
+        cursor.close()
+        connection.close()
 
 
 # ---------------------------------------------------------------------
@@ -351,32 +494,41 @@ with DAG(
         python_callable=enrich_and_export_csv,
         provide_context=True,
         params={
-            # Root
-            "root_folder": "/opt/airflow/data/google_excels",
-            "output_dir": "/opt/airflow/data",
+            # ✅ on garde ton chemin qui marchait
+            "root_folder": "/opt/airflow/data",
 
-            # Columns
-            "name_col": "name",
-            "address_col": "address",
+            "name_col": "OSrXXb",
+            "address_col": "rllt__details 3",
+            "website_col": "MRe4xd href",
 
             # Playwright
             "headless": True,
             "tt_state_path": "/opt/airflow/data/tt_state.json",
 
-            # Social platforms (modifiable at Trigger DAG)
-            # - do_youtube  : enrich YouTube Shorts
-            # - do_tiktok   : enrich TikTok video
-            # - do_instagram: enrich Instagram Reel (best effort, no login)
+            # ✅ Social flags (modifiables au Trigger DAG)
             "do_youtube": True,
             "do_tiktok": True,
-            "do_instagram": False,
+            "do_instagram": True,
 
-            # Geocode
+            # ✅ Geocode ON pour corriger lat/lon
             "do_geocode": True,
             "geocode_cache": "/opt/airflow/data/geocode_cache.csv",
 
-            # Debug
+            # 🧪 DEBUG: mets None pour revenir au normal
             "debug_limit_rows": 5,
+
+            "output_dir": "/opt/airflow/data",
+        },
+    )
+
+    t2 = PythonOperator(
+        task_id="upsert_events_from_csv",
+        python_callable=upsert_events_from_csv,
+        provide_context=True,
+        params={
+            "name_col": "OSrXXb",
+            "address_col": "rllt__details 3",
+            "website_col": "MRe4xd href",
 
             # ✅ region = category par défaut
             "use_category_as_region": True,
@@ -387,15 +539,6 @@ with DAG(
             "max_participants": 99999999,
             "access_comment": True,
             "validated_from_web": False,
-        },
-    )
-
-    t2 = PythonOperator(
-        task_id="load_csv_to_db",
-        python_callable=load_csv_to_db,
-        provide_context=True,
-        params={
-            "table": "profil_event",
         },
     )
 
