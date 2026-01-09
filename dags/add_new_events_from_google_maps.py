@@ -12,8 +12,10 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import psycopg2
 from psycopg2 import sql
+
 from airflow import DAG
 from airflow.hooks.base import BaseHook
+from airflow.models.param import Param
 from airflow.operators.python import PythonOperator
 from airflow.utils.dates import days_ago
 
@@ -36,7 +38,7 @@ DAG_DOC = r"""
 
 ## Debug rapide
 - `debug_limit_rows: 5` => limite le dataframe à 5 lignes AVANT Playwright + geocode.
-- Pour revenir au normal: mets `debug_limit_rows: None`.
+- Pour revenir au normal: mets `debug_limit_rows: null`.
 """
 
 
@@ -157,7 +159,7 @@ def _exec_update(cursor, table: str, event_id: int, data: dict[str, object]):
 def enrich_and_export_csv(**context):
     params = context["params"]
 
-    # ✅ On garde ton root_folder (celui qui marchait)
+    # Root folder (celui qui marche chez toi)
     root_folder = params["root_folder"]
     name_col = params["name_col"]
     address_col = params["address_col"]
@@ -166,7 +168,7 @@ def enrich_and_export_csv(**context):
     headless = bool(params.get("headless", True))
     tt_state_path = params.get("tt_state_path")
 
-    # Social flags (Trigger DAG)
+    # Social flags (DAG Params visibles dans Trigger DAG)
     do_youtube = bool(params.get("do_youtube", True))
     do_tiktok = bool(params.get("do_tiktok", True))
     do_instagram = bool(params.get("do_instagram", True))
@@ -175,8 +177,8 @@ def enrich_and_export_csv(**context):
     do_geocode = bool(params.get("do_geocode", True))
     geocode_cache = params.get("geocode_cache", "/opt/airflow/data/geocode_cache.csv")
 
-    # 🧪 Debug
-    debug_limit_rows = params.get("debug_limit_rows", 5)  # mets None pour full
+    # Debug (DAG Param visible)
+    debug_limit_rows = params.get("debug_limit_rows", 5)  # None/null => full
 
     output_dir = params.get("output_dir", "/opt/airflow/data")
     os.makedirs(output_dir, exist_ok=True)
@@ -199,7 +201,7 @@ def enrich_and_export_csv(**context):
         )
     )
 
-    # colonnes minimales attendues (pour CSV stable)
+    # colonnes minimales attendues (CSV stable)
     for col in [
         "category",
         "source_folder",
@@ -232,7 +234,7 @@ def upsert_events_from_csv(**context):
     address_col = params["address_col"]
     website_col = params.get("website_col", "MRe4xd href")
 
-    # ✅ IMPORTANT: region = category (dossier) par défaut
+    # IMPORTANT: region = category par défaut
     region_default = params.get("region_default", "Paris")
     use_category_as_region = bool(params.get("use_category_as_region", True))
 
@@ -276,8 +278,6 @@ def upsert_events_from_csv(**context):
                 continue
 
             category = safe_str(row.get("category")) or None
-
-            # ✅ region depuis category (bar paris / escape game paris / etc)
             region = (category if (use_category_as_region and category) else safe_str(region_default)) or "Paris"
 
             city = guess_city(adresse) or "Paris"
@@ -485,6 +485,34 @@ with DAG(
     catchup=False,
     default_args=default_args,
     tags=["event", "import", "tiktok", "youtube", "instagram", "playwright"],
+
+    # ✅ Params AU NIVEAU DU DAG => visibles dans Trigger DAG (UI)
+    params={
+        "do_youtube": Param(
+            True,
+            type="boolean",
+            title="Inclure YouTube",
+            description="Scraper YouTube Shorts",
+        ),
+        "do_tiktok": Param(
+            True,
+            type="boolean",
+            title="Inclure TikTok",
+            description="Scraper TikTok",
+        ),
+        "do_instagram": Param(
+            True,
+            type="boolean",
+            title="Inclure Instagram",
+            description="Scraper Instagram (best effort, sans login)",
+        ),
+        "debug_limit_rows": Param(
+            5,
+            type=["integer", "null"],
+            title="Debug limit rows",
+            description="Nombre max de lignes (null = tout)",
+        ),
+    },
 ) as dag:
     dag.doc_md = DAG_DOC
     dag.timezone = PARIS_TZ
@@ -494,7 +522,7 @@ with DAG(
         python_callable=enrich_and_export_csv,
         provide_context=True,
         params={
-            # ✅ on garde ton chemin qui marchait
+            # on garde ton chemin qui marche
             "root_folder": "/opt/airflow/data",
 
             "name_col": "OSrXXb",
@@ -505,19 +533,16 @@ with DAG(
             "headless": True,
             "tt_state_path": "/opt/airflow/data/tt_state.json",
 
-            # ✅ Social flags (modifiables au Trigger DAG)
-            "do_youtube": True,
-            "do_tiktok": True,
-            "do_instagram": True,
-
-            # ✅ Geocode ON pour corriger lat/lon
+            # Geocode
             "do_geocode": True,
             "geocode_cache": "/opt/airflow/data/geocode_cache.csv",
 
-            # 🧪 DEBUG: mets None pour revenir au normal
-            "debug_limit_rows": 5,
-
             "output_dir": "/opt/airflow/data",
+
+            # ⚠️ IMPORTANT:
+            # PAS de do_youtube / do_tiktok / do_instagram ici,
+            # sinon tu écrases les choix faits dans Trigger DAG.
+            # PAS de debug_limit_rows ici non plus (il est au niveau DAG).
         },
     )
 
@@ -530,7 +555,7 @@ with DAG(
             "address_col": "rllt__details 3",
             "website_col": "MRe4xd href",
 
-            # ✅ region = category par défaut
+            # region = category par défaut
             "use_category_as_region": True,
             "region_default": "Paris",
 

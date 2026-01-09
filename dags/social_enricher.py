@@ -477,14 +477,14 @@ async def run_pipeline(
     geocode_cache: str = "geocode_cache.csv",
     tt_state_path: str = "tt_state.json",
     headless: bool = True,
-    debug_limit_rows: int | None = None,   # ✅ debug
+    debug_limit_rows: int | None = None,   # debug
     do_youtube: bool = True,
     do_tiktok: bool = True,
     do_instagram: bool = True,
 ) -> pd.DataFrame:
     df = load_all_google_excels(root_folder=root_folder)
 
-    # ✅ debug limit AVANT geocode + playwright
+    # debug limit AVANT geocode + playwright
     if debug_limit_rows is not None:
         df = df.head(int(debug_limit_rows)).copy()
         logging.warning("🧪 [debug] Limitation DataFrame à %s lignes (debug_limit_rows=%s)", len(df), debug_limit_rows)
@@ -527,7 +527,7 @@ def main():
     parser.add_argument("--debug-limit-rows", type=int, default=None, help="Limit rows before enrichment")
     parser.add_argument("--out", default="enriched.csv", help="Output CSV path")
 
-    # ✅ flags de désactivation (par défaut tout est ON)
+    # flags de désactivation (par défaut tout est ON)
     parser.add_argument("--no-youtube", action="store_true", help="Disable YouTube enrichment")
     parser.add_argument("--no-tiktok", action="store_true", help="Disable TikTok enrichment")
     parser.add_argument("--no-instagram", action="store_true", help="Disable Instagram enrichment")
