@@ -311,7 +311,7 @@ async def add_youtube_shorts_to_df(
 ) -> pd.DataFrame:
     df = df.copy()
     df["youtube_query"] = None
-    df["youtube_video"] = None  # JSON list de shorts
+    df["youtube_video"] = None
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
@@ -394,7 +394,7 @@ async def add_tiktok_videos_to_df(
 ) -> pd.DataFrame:
     df = df.copy()
     df["tiktok_query"] = None
-    df["tiktok_video"] = None  # JSON list
+    df["tiktok_video"] = None
 
     storage_state = tt_state_path if tt_state_path and Path(tt_state_path).exists() else None
     if tt_state_path and storage_state is None:
@@ -433,8 +433,6 @@ async def add_tiktok_videos_to_df(
 
 # ============================================================
 # 5) Instagram
-#    - Preferred: Playwright (requires ig_state.json ideally)
-#    - Fallback: DuckDuckGo HTML (best effort)
 # ============================================================
 
 def _duckduckgo_html_search(query: str, timeout: int = 20) -> str:
@@ -490,12 +488,10 @@ async def _handle_instagram_popups_best_effort(page) -> None:
 
 
 async def _find_instagram_links_list(page, query: str, *, max_results: int = 5) -> list[str]:
-    # Aller sur IG (si pas loggué, blocage fréquent)
     await page.goto("https://www.instagram.com/", wait_until="domcontentloaded", timeout=60000)
     await page.wait_for_timeout(1500)
     await _handle_instagram_popups_best_effort(page)
 
-    # Trouver un input de recherche (IG change souvent ses sélecteurs)
     search_selectors = [
         "input[aria-label='Search input']",
         "input[placeholder*='Rechercher']",
@@ -523,7 +519,6 @@ async def _find_instagram_links_list(page, query: str, *, max_results: int = 5) 
     except Exception:
         return []
 
-    # Souvent il faut Enter (parfois 2 fois) pour ouvrir une page / résultats
     try:
         await page.keyboard.press("Enter")
         await page.wait_for_timeout(900)
@@ -568,16 +563,10 @@ async def add_instagram_videos_to_df(
     ig_state_path: str = "ig_state.json",
     max_results: int = 5,
 ) -> pd.DataFrame:
-    """
-    Remplit:
-    - instagram_query
-    - instagram_reel  (1er lien)
-    - instagram_video (JSON list des liens)
-    """
     df = df.copy()
     df["instagram_query"] = None
     df["instagram_reel"] = None
-    df["instagram_video"] = None  # JSON list
+    df["instagram_video"] = None
 
     storage_state = ig_state_path if ig_state_path and Path(ig_state_path).exists() else None
     if ig_state_path and storage_state is None:
@@ -604,7 +593,6 @@ async def add_instagram_videos_to_df(
             try:
                 links = await _find_instagram_links_list(page, query, max_results=max_results)
 
-                # fallback DuckDuckGo (ton ancien code)
                 if not links:
                     ddg = find_instagram_reel_link(query)
                     links = [ddg] if ddg else []
@@ -649,7 +637,6 @@ async def run_pipeline(
     if do_geocode:
         df = add_lat_lng(df, address_col=address_col, cache_path=geocode_cache)
 
-    # colonnes stables
     for c in [
         "youtube_query", "youtube_video",
         "tiktok_query", "tiktok_video",

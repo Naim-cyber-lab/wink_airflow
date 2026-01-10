@@ -39,6 +39,10 @@ DAG_DOC = r"""
   - instagram_query
   - instagram_reel (first)
   - instagram_video = JSON list (preferred)
+
+Logs DB:
+- SKIP / INSERT / UPDATE / NOOP (aucun changement effectif)
+- affiche id, titre, adresse, colonnes modifiées, et stats médias
 """
 
 POSTAL_RE = re.compile(r"\b(\d{5})\b")
@@ -101,6 +105,43 @@ def _json_preview_list(json_list_str: str | None, limit: int = 10) -> list[str]:
     return []
 
 
+# -------------------------
+# LOG HELPERS (new)
+# -------------------------
+
+def _short(s: str | None, n: int = 80) -> str:
+    s = safe_str(s)
+    if not s:
+        return ""
+    s = " ".join(s.split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _media_stats(label: str, json_list_str: str | None) -> str:
+    lst = _json_preview_list(json_list_str, limit=3)
+    try:
+        full = json.loads(json_list_str) if json_list_str else []
+        count = len(full) if isinstance(full, list) else 0
+    except Exception:
+        count = 0
+    preview = ", ".join([_short(x, 50) for x in lst]) if lst else ""
+    return f"{label}={count}" + (f" | preview: {preview}" if preview else "")
+
+
+def _log_row(action: str, *, titre: str, adresse: str, event_id: int | None = None, details: str = "") -> None:
+    base = f"[db] {action}"
+    if event_id is not None:
+        base += f" id={event_id}"
+    base += f" | titre='{_short(titre, 60)}' | adresse='{_short(adresse, 80)}'"
+    if details:
+        base += f" | {details}"
+    logging.info(base)
+
+
+# -------------------------
+# BIO builder
+# -------------------------
+
 def _build_bio(
     old_bio: str,
     *,
@@ -151,11 +192,8 @@ def _build_bio(
                 lines.append(bullet)
 
     add_line("Instagram query", instagram_query)
-
-    # On garde "Instagram Reel" (compat)
     add_line("Instagram Reel", instagram_reel)
 
-    # Préfère la liste instagram_video si dispo
     ig_list = _json_preview_list(instagram_video_json)
     if ig_list:
         add_line("Instagram (first)", ig_list[0])
@@ -208,11 +246,10 @@ def enrich_and_export_csv(**context):
     tt_state_path = params.get("tt_state_path")
     ig_state_path = params.get("ig_state_path")
 
-    # DAG params (UI Trigger)
     do_youtube = bool(params.get("do_youtube", True))
     do_tiktok = bool(params.get("do_tiktok", True))
     do_instagram = bool(params.get("do_instagram", True))
-    debug_limit_rows = params.get("debug_limit_rows", 5)  # None => full
+    debug_limit_rows = params.get("debug_limit_rows", 5)
 
     do_geocode = bool(params.get("do_geocode", True))
     geocode_cache = params.get("geocode_cache", "/opt/airflow/data/geocode_cache.csv")
@@ -263,7 +300,7 @@ def enrich_and_export_csv(**context):
 
 
 # ---------------------------------------------------------------------
-# Task 2: upsert
+# Task 2: upsert (with detailed logs)
 # ---------------------------------------------------------------------
 def upsert_events_from_csv(**context):
     params = context["params"]
@@ -301,6 +338,7 @@ def upsert_events_from_csv(**context):
 
     inserted = 0
     updated = 0
+    noops = 0
     skipped = 0
 
     try:
@@ -312,6 +350,7 @@ def upsert_events_from_csv(**context):
             adresse = safe_str(row.get(address_col))
             if not titre or not adresse:
                 skipped += 1
+                _log_row("SKIP", titre=titre, adresse=adresse, details="missing titre or adresse")
                 continue
 
             category = safe_str(row.get("category")) or None
@@ -333,6 +372,12 @@ def upsert_events_from_csv(**context):
 
             lat = row.get("latitude", None)
             lon = row.get("longitude", None)
+
+            media_info = " | ".join([
+                _media_stats("yt", youtube_video),
+                _media_stats("tt", tiktok_video),
+                _media_stats("ig", instagram_video),
+            ])
 
             cursor.execute(
                 """
@@ -363,19 +408,22 @@ def upsert_events_from_csv(**context):
 
                 update_map: dict[str, object] = {}
 
-                if "bioEvent" in cols:
+                # bio: update only if changed (avoid useless UPDATE)
+                if "bioEvent" in cols and new_bio and new_bio != (old_bio or ""):
                     update_map["bioEvent"] = new_bio
+
                 if "website" in cols and (old_website is None and website is not None):
                     update_map["website"] = website
 
+                # geo: set only if NULL before
                 if "lat" in cols and old_lat is None and lat is not None:
                     update_map["lat"] = float(lat)
                 if "lon" in cols and old_lon is None and lon is not None:
                     update_map["lon"] = float(lon)
 
-                if "region" in cols:
+                if "region" in cols and region:
                     update_map["region"] = region
-                if "city" in cols:
+                if "city" in cols and city:
                     update_map["city"] = city
                 if "codePostal" in cols and code_postal:
                     update_map["codePostal"] = code_postal
@@ -402,8 +450,24 @@ def upsert_events_from_csv(**context):
 
                 if update_map:
                     _exec_update(cursor, "profil_event", int(event_id), update_map)
+                    updated += 1
+                    _log_row(
+                        "UPDATE",
+                        event_id=int(event_id),
+                        titre=titre,
+                        adresse=adresse,
+                        details=f"cols={sorted(update_map.keys())} | {media_info}",
+                    )
+                else:
+                    noops += 1
+                    _log_row(
+                        "NOOP",
+                        event_id=int(event_id),
+                        titre=titre,
+                        adresse=adresse,
+                        details=f"no column changed | {media_info}",
+                    )
 
-                updated += 1
                 continue
 
             # INSERT
@@ -483,11 +547,18 @@ def upsert_events_from_csv(**context):
             if not insert_map:
                 raise RuntimeError("Aucune colonne détectée pour insert dans profil_event (schéma inattendu).")
 
-            _exec_insert(cursor, "profil_event", insert_map)
+            new_id = _exec_insert(cursor, "profil_event", insert_map)
             inserted += 1
+            _log_row(
+                "INSERT",
+                event_id=int(new_id),
+                titre=titre,
+                adresse=adresse,
+                details=f"cols={sorted(insert_map.keys())} | {media_info}",
+            )
 
         connection.commit()
-        logging.info("✅ [db] Inserted=%s Updated=%s Skipped=%s", inserted, updated, skipped)
+        logging.info("✅ [db] Inserted=%s Updated=%s Noop=%s Skipped=%s", inserted, updated, noops, skipped)
 
     except Exception as e:
         connection.rollback()
@@ -551,6 +622,7 @@ with DAG(
             "region_default": "Paris",
             "creator_winker_id": 116,
             "active_default": 0,
+            "maxNumberParticipant": 99999999,
             "max_participants": 99999999,
             "access_comment": True,
             "validated_from_web": False,
