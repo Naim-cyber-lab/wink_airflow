@@ -30,13 +30,13 @@ YOUTUBE_SHORTS_URL_RE = re.compile(r"^https?://(www\.)?youtube\.com/shorts/[^/?#
 TIKTOK_VIDEO_URL_RE = re.compile(r"^https?://(www\.)?tiktok\.com/@[^/]+/video/\d+", re.IGNORECASE)
 
 # DuckDuckGo fallback regex (ancien comportement)
-INSTAGRAM_REEL_RE = re.compile(
+instagram_video_RE = re.compile(
     r"https?://(?:www\.)?instagram\.com/(?:reel|reels)/[A-Za-z0-9_\-]+/?",
     re.IGNORECASE,
 )
 
 # Playwright scraping regex (on accepte aussi /p/)
-INSTAGRAM_REEL_OR_POST_RE = re.compile(
+instagram_video_OR_POST_RE = re.compile(
     r"^https?://(?:www\.)?instagram\.com/(?:reel|reels|p)/[A-Za-z0-9_\-]+/?",
     re.IGNORECASE,
 )
@@ -445,13 +445,13 @@ def _duckduckgo_html_search(query: str, timeout: int = 20) -> str:
         return resp.read().decode("utf-8", errors="ignore")
 
 
-def find_instagram_reel_link(query: str) -> str | None:
+def find_instagram_video_link(query: str) -> str | None:
     try:
         html = _duckduckgo_html_search(f"site:instagram.com/reel {query}")
     except (HTTPError, URLError, TimeoutError, Exception):
         return None
 
-    m = INSTAGRAM_REEL_RE.search(html)
+    m = instagram_video_RE.search(html)
     if m:
         return m.group(0)
 
@@ -460,7 +460,7 @@ def find_instagram_reel_link(query: str) -> str | None:
     except Exception:
         return None
 
-    m = INSTAGRAM_REEL_RE.search(html)
+    m = instagram_video_RE.search(html)
     return m.group(0) if m else None
 
 
@@ -540,7 +540,7 @@ async def _find_instagram_links_list(page, query: str, *, max_results: int = 5) 
                 href = "https://www.instagram.com" + href
             href = href.split("?")[0]
 
-            if INSTAGRAM_REEL_OR_POST_RE.match(href) and href not in results:
+            if instagram_video_OR_POST_RE.match(href) and href not in results:
                 results.append(href)
 
             if len(results) >= max_results:
@@ -565,7 +565,7 @@ async def add_instagram_videos_to_df(
 ) -> pd.DataFrame:
     df = df.copy()
     df["instagram_query"] = None
-    df["instagram_reel"] = None
+    df["instagram_video"] = None
     df["instagram_video"] = None
 
     storage_state = ig_state_path if ig_state_path and Path(ig_state_path).exists() else None
@@ -594,14 +594,14 @@ async def add_instagram_videos_to_df(
                 links = await _find_instagram_links_list(page, query, max_results=max_results)
 
                 if not links:
-                    ddg = find_instagram_reel_link(query)
+                    ddg = find_instagram_video_link(query)
                     links = [ddg] if ddg else []
 
-                df.at[i, "instagram_reel"] = links[0] if links else None
+                df.at[i, "instagram_video"] = links[0] if links else None
                 df.at[i, "instagram_video"] = json.dumps(links, ensure_ascii=False) if links else None
             except Exception as e:
                 logging.warning("[instagram] failed query=%r err=%s", query, e)
-                df.at[i, "instagram_reel"] = None
+                df.at[i, "instagram_video"] = None
                 df.at[i, "instagram_video"] = None
 
         await context.close()
@@ -640,7 +640,7 @@ async def run_pipeline(
     for c in [
         "youtube_query", "youtube_video",
         "tiktok_query", "tiktok_video",
-        "instagram_query", "instagram_reel", "instagram_video",
+        "instagram_query", "instagram_video", "instagram_video",
     ]:
         if c not in df.columns:
             df[c] = None
