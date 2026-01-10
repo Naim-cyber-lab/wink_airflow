@@ -14,7 +14,7 @@ from urllib.request import Request, urlopen
 import pandas as pd
 from playwright.async_api import async_playwright
 
-# Optionnel (lat/lng)
+# Optional (lat/lng)
 try:
     from geopy.extra.rate_limiter import RateLimiter
     from geopy.geocoders import Nominatim
@@ -29,15 +29,18 @@ GOOGLE_FILE_RE = re.compile(r"^google(?: \(\d+\))?\.xlsx$", re.IGNORECASE)
 YOUTUBE_SHORTS_URL_RE = re.compile(r"^https?://(www\.)?youtube\.com/shorts/[^/?#]+", re.IGNORECASE)
 TIKTOK_VIDEO_URL_RE = re.compile(r"^https?://(www\.)?tiktok\.com/@[^/]+/video/\d+", re.IGNORECASE)
 
-# Instagram
+# Instagram (accept reels/reel/p)
 INSTAGRAM_ANY_VIDEO_RE = re.compile(
     r"^https?://(?:www\.)?instagram\.com/(?:reel|reels|p)/[A-Za-z0-9_\-]+/?$",
     re.IGNORECASE,
 )
 INSTAGRAM_REEL_OR_POST_RE = re.compile(
-    r"^https?://(?:www\.)?instagram\.com/(?:reel|reels|p)/[A-Za-z0-9_\-]+/?",
+    r"https?://(?:www\.)?instagram\.com/(?:reel|reels|p)/[A-Za-z0-9_\-]+/?",
     re.IGNORECASE,
 )
+
+# FR address heuristic: "75011 Paris" -> "Paris"
+POSTAL_CITY_FR_RE = re.compile(r"\b\d{5}\s+([A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ'\- ]{2,})\b")
 
 
 # ============================================================
@@ -79,7 +82,7 @@ def compute_row_id(row: pd.Series, key_cols: list[str]) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
-def build_query(name, address, fallback=None) -> str:
+def build_query(name: str, address: str, fallback: str | None = None) -> str:
     name = safe_str(name)
     address = safe_str(address)
     fallback = safe_str(fallback)
@@ -99,6 +102,25 @@ def normalize_instagram_url(u: str) -> str:
     if u.startswith("https://www.instagram.com//"):
         u = u.replace("https://www.instagram.com//", "https://www.instagram.com/")
     return u + "/"
+
+
+def extract_city_from_address_fr(address: str) -> str | None:
+    """
+    Ex: '3 Rue Faidherbe, 75011 Paris' -> 'Paris'
+    Ex: '40 Bd ..., 75010 PARIS' -> 'PARIS'
+    Returns None if not found.
+    """
+    address = safe_str(address)
+    if not address:
+        return None
+
+    m = POSTAL_CITY_FR_RE.search(address)
+    if not m:
+        return None
+
+    city = m.group(1).strip()
+    city = re.split(r",|/|\(|\)", city)[0].strip()
+    return city or None
 
 
 # ============================================================
@@ -187,8 +209,7 @@ def add_lat_lng(
         if not a or a.lower() == "nan":
             return ""
         a_low = a.lower()
-        if "paris" not in a_low:
-            a = f"{a}, Paris"
+        # keep generic, don't force Paris here
         if "france" not in a_low:
             a = f"{a}, France"
         return a
@@ -443,10 +464,13 @@ async def add_tiktok_videos_to_df(
 
 
 # ============================================================
-# 5) Instagram (Playwright + fallback DDG corrigé)
+# 5) Instagram (Playwright best-effort + DDG fallback "loose")
 # ============================================================
 
-def _duckduckgo_html_search(query: str, timeout: int = 20) -> str:
+def _duckduckgo_html_search(query: str, timeout: int = 25) -> str:
+    """
+    DuckDuckGo /html/ (no JS).
+    """
     url = "https://duckduckgo.com/html/?q=" + quote_plus(query)
     req = Request(
         url,
@@ -454,35 +478,38 @@ def _duckduckgo_html_search(query: str, timeout: int = 20) -> str:
             "User-Agent": (
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/120 Safari/537.36"
-            )
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+            "Referer": "https://duckduckgo.com/",
         },
     )
     with urlopen(req, timeout=timeout) as resp:
         return resp.read().decode("utf-8", errors="ignore")
 
 
-def _extract_instagram_links_from_ddg_html(html: str, max_results: int = 5) -> list[str]:
+def _extract_instagram_links_from_html(html: str, max_results: int = 5) -> list[str]:
     """
-    DDG /html/ renvoie souvent des liens intermédiaires:
-      /l/?uddg=<URLENCODED>
-    On décode uddg et on filtre instagram reel/reels/p.
+    Extract IG video links from HTML. Supports:
+      - DDG redirect links: uddg=<urlencoded>
+      - direct instagram.com/(reel|reels|p)/...
     """
     links: list[str] = []
 
-    # 1) uddg=... (cas le plus courant)
+    # (1) DDG redirect (uddg=...)
     for m in re.finditer(r"uddg=([^&\"'>\s]+)", html):
         try:
             decoded = unquote(m.group(1))
-            decoded = normalize_instagram_url(decoded)
-            if INSTAGRAM_ANY_VIDEO_RE.match(decoded) and decoded not in links:
-                links.append(decoded)
+            u = normalize_instagram_url(decoded)
+            if INSTAGRAM_ANY_VIDEO_RE.match(u) and u not in links:
+                links.append(u)
                 if len(links) >= max_results:
                     return links
         except Exception:
             continue
 
-    # 2) parfois URL en clair
-    for m in re.finditer(r"https?://(?:www\.)?instagram\.com/(?:reel|reels|p)/[A-Za-z0-9_\-]+/?", html, re.I):
+    # (2) direct urls
+    for m in re.finditer(INSTAGRAM_REEL_OR_POST_RE, html):
         u = normalize_instagram_url(m.group(0))
         if INSTAGRAM_ANY_VIDEO_RE.match(u) and u not in links:
             links.append(u)
@@ -492,26 +519,53 @@ def _extract_instagram_links_from_ddg_html(html: str, max_results: int = 5) -> l
     return links
 
 
-def find_instagram_links_ddg(query: str, max_results: int = 5) -> list[str]:
+def find_instagram_links_ddg_loose(place_name: str, city: str | None, max_results: int = 5) -> list[str]:
     """
-    Cherche sur DDG des pages IG vidéo liées au lieu.
+    DDG fallback for IG:
+      - do NOT use full street address (too strict)
+      - use place name + (city if available), else without city
     """
-    queries = [
-        f'site:instagram.com (reel OR reels OR p) "{query}"',
-        f"site:instagram.com/reel {query}",
-        f"site:instagram.com/p {query}",
-    ]
+    place_name = safe_str(place_name)
+    city = safe_str(city) or None
+    if not place_name:
+        return []
 
-    for q in queries:
+    variants: list[str] = []
+    if city:
+        variants.extend([
+            f'site:instagram.com (reel OR reels OR p) "{place_name}" "{city}"',
+            f'site:instagram.com "{place_name}" "{city}" instagram',
+            f'{place_name} "{city}" site:instagram.com',
+            f'{place_name} instagram "{city}"',
+        ])
+    variants.extend([
+        f'site:instagram.com (reel OR reels OR p) "{place_name}"',
+        f'site:instagram.com "{place_name}" instagram',
+        f'{place_name} site:instagram.com',
+    ])
+
+    last_q = None
+    last_html_sample = ""
+
+    for q in variants:
+        last_q = q
         try:
             html = _duckduckgo_html_search(q)
-        except (HTTPError, URLError, TimeoutError, Exception):
+            last_html_sample = html[:800]
+        except Exception:
             continue
 
-        links = _extract_instagram_links_from_ddg_html(html, max_results=max_results)
+        links = _extract_instagram_links_from_html(html, max_results=max_results)
         if links:
             return links
 
+    if last_q is not None:
+        logging.info(
+            "[instagram][ddg-debug] no links. last_query=%r html_len=%s sample=%r",
+            last_q,
+            len(last_html_sample),
+            last_html_sample[:200],
+        )
     return []
 
 
@@ -539,11 +593,13 @@ async def _handle_instagram_popups_best_effort(page) -> None:
 
 
 async def _find_instagram_links_list(page, query: str, *, max_results: int = 5) -> list[str]:
+    """
+    Best-effort IG UI scraping (often blocked without valid ig_state).
+    """
     await page.goto("https://www.instagram.com/", wait_until="domcontentloaded", timeout=60000)
     await page.wait_for_timeout(1500)
     await _handle_instagram_popups_best_effort(page)
 
-    # NB: IG change souvent ses selectors => best effort
     search_selectors = [
         "input[aria-label='Search input']",
         "input[placeholder*='Rechercher']",
@@ -592,7 +648,7 @@ async def _find_instagram_links_list(page, query: str, *, max_results: int = 5) 
                 href = "https://www.instagram.com" + href
             href = normalize_instagram_url(href)
 
-            if INSTAGRAM_REEL_OR_POST_RE.match(href) and href not in results:
+            if INSTAGRAM_ANY_VIDEO_RE.match(href) and href not in results:
                 results.append(href)
 
             if len(results) >= max_results:
@@ -616,9 +672,14 @@ async def add_instagram_videos_to_df(
     max_results: int = 5,
 ) -> pd.DataFrame:
     """
-    Remplit:
-      - instagram_query
-      - instagram_video : JSON list de liens instagram (reel/reels/p)
+    Fill:
+      - instagram_query (UI query, debug)
+      - instagram_video : JSON list of IG video URLs (reel/reels/p)
+
+    Strategy:
+      1) Try Playwright UI (may be blocked)
+      2) Fallback DDG loose: use PLACE NAME + (CITY if possible), NOT street address
+         - city is taken from df['city'] if exists, else extracted from full address, else df['region'], else None
     """
     df = df.copy()
     df["instagram_query"] = None
@@ -626,7 +687,7 @@ async def add_instagram_videos_to_df(
 
     storage_state = ig_state_path if ig_state_path and Path(ig_state_path).exists() else None
     if ig_state_path and storage_state is None:
-        logging.warning("[instagram] ig_state introuvable (%s) -> sans storageState (Playwright blocage probable)", ig_state_path)
+        logging.warning("[instagram] ig_state introuvable (%s) -> Playwright IG probablement bloqué", ig_state_path)
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
@@ -639,33 +700,42 @@ async def add_instagram_videos_to_df(
         page = await context.new_page()
 
         for i, row in df.iterrows():
-            query = build_query(
-                safe_str(row.get(name_col)),
-                safe_str(row.get(address_col)),
-                fallback=safe_str(row.get("category")),
-            )
-            df.at[i, "instagram_query"] = query
+            place_name = safe_str(row.get(name_col))
+            address = safe_str(row.get(address_col))
 
+            query_ui = build_query(place_name, address, fallback=safe_str(row.get("category")))
+            df.at[i, "instagram_query"] = query_ui
+
+            links: list[str] = []
+
+            # 1) Playwright
             try:
-                # 1) Try Playwright IG
-                links = await _find_instagram_links_list(page, query, max_results=max_results)
-                logging.info("[instagram] query=%r found=%s", query, len(links))
+                links = await _find_instagram_links_list(page, query_ui, max_results=max_results)
+                logging.info("[instagram] query=%r found=%s", query_ui, len(links))
                 if links:
                     logging.info("[instagram] first=%s", links[0])
-
-                # 2) Fallback DDG (corrigé)
-                if not links:
-                    ddg_links = find_instagram_links_ddg(query, max_results=max_results)
-                    logging.info("[instagram] fallback DDG found=%s", len(ddg_links))
-                    if ddg_links:
-                        logging.info("[instagram] fallback first=%s", ddg_links[0])
-                    links = ddg_links
-
-                df.at[i, "instagram_video"] = json.dumps(links, ensure_ascii=False) if links else None
-
             except Exception as e:
-                logging.warning("[instagram] failed query=%r err=%s", query, e)
-                df.at[i, "instagram_video"] = None
+                logging.warning("[instagram] playwright failed query=%r err=%s", query_ui, e)
+                links = []
+
+            # 2) DDG loose
+            if not links:
+                # priority: existing city column > extract from full address > region column > None
+                city = None
+                if "city" in df.columns:
+                    city = safe_str(row.get("city")) or None
+                if not city:
+                    city = extract_city_from_address_fr(address)
+                if not city and "region" in df.columns:
+                    city = safe_str(row.get("region")) or None
+
+                ddg_links = find_instagram_links_ddg_loose(place_name=place_name, city=city, max_results=max_results)
+                logging.info("[instagram] fallback DDG loose found=%s (place=%r city=%r)", len(ddg_links), place_name, city)
+                if ddg_links:
+                    logging.info("[instagram] fallback first=%s", ddg_links[0])
+                links = ddg_links
+
+            df.at[i, "instagram_video"] = json.dumps(links, ensure_ascii=False) if links else None
 
         await context.close()
         await browser.close()
@@ -706,7 +776,6 @@ async def run_pipeline(
     if do_geocode:
         df = add_lat_lng(df, address_col=address_col, cache_path=geocode_cache)
 
-    # Colonnes stables
     for c in [
         "youtube_query", "youtube_video",
         "tiktok_query", "tiktok_video",
