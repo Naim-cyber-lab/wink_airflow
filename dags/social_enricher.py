@@ -16,8 +16,8 @@ from playwright.async_api import async_playwright
 
 # Optionnel (lat/lng)
 try:
-    from geopy.geocoders import Nominatim
     from geopy.extra.rate_limiter import RateLimiter
+    from geopy.geocoders import Nominatim
 except Exception:
     Nominatim = None
     RateLimiter = None
@@ -29,8 +29,15 @@ GOOGLE_FILE_RE = re.compile(r"^google(?: \(\d+\))?\.xlsx$", re.IGNORECASE)
 YOUTUBE_SHORTS_URL_RE = re.compile(r"^https?://(www\.)?youtube\.com/shorts/[^/?#]+", re.IGNORECASE)
 TIKTOK_VIDEO_URL_RE = re.compile(r"^https?://(www\.)?tiktok\.com/@[^/]+/video/\d+", re.IGNORECASE)
 
+# DuckDuckGo fallback regex (ancien comportement)
 INSTAGRAM_REEL_RE = re.compile(
     r"https?://(?:www\.)?instagram\.com/(?:reel|reels)/[A-Za-z0-9_\-]+/?",
+    re.IGNORECASE,
+)
+
+# Playwright scraping regex (on accepte aussi /p/)
+INSTAGRAM_REEL_OR_POST_RE = re.compile(
+    r"^https?://(?:www\.)?instagram\.com/(?:reel|reels|p)/[A-Za-z0-9_\-]+/?",
     re.IGNORECASE,
 )
 
@@ -272,7 +279,6 @@ async def _find_youtube_shorts_list(page, query: str, *, max_results: int = 5) -
 
     await _handle_youtube_consent_best_effort(page)
 
-    # scroll pour charger plus
     for _ in range(6):
         try:
             await page.mouse.wheel(0, 1600)
@@ -305,7 +311,7 @@ async def add_youtube_shorts_to_df(
 ) -> pd.DataFrame:
     df = df.copy()
     df["youtube_query"] = None
-    df["youtube_video"] = None  # ✅ JSON list de shorts
+    df["youtube_video"] = None  # JSON list de shorts
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
@@ -388,7 +394,7 @@ async def add_tiktok_videos_to_df(
 ) -> pd.DataFrame:
     df = df.copy()
     df["tiktok_query"] = None
-    df["tiktok_video"] = None  # ✅ JSON list
+    df["tiktok_video"] = None  # JSON list
 
     storage_state = tt_state_path if tt_state_path and Path(tt_state_path).exists() else None
     if tt_state_path and storage_state is None:
@@ -397,7 +403,7 @@ async def add_tiktok_videos_to_df(
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
 
-        ctx_kwargs = {}
+        ctx_kwargs: dict = {}
         if storage_state:
             ctx_kwargs["storage_state"] = storage_state
 
@@ -426,7 +432,9 @@ async def add_tiktok_videos_to_df(
 
 
 # ============================================================
-# 5) Instagram (best effort) via DuckDuckGo
+# 5) Instagram
+#    - Preferred: Playwright (requires ig_state.json ideally)
+#    - Fallback: DuckDuckGo HTML (best effort)
 # ============================================================
 
 def _duckduckgo_html_search(query: str, timeout: int = 20) -> str:
@@ -458,22 +466,158 @@ def find_instagram_reel_link(query: str) -> str | None:
     return m.group(0) if m else None
 
 
-def add_instagram_reels_to_df(df: pd.DataFrame, name_col: str, address_col: str) -> pd.DataFrame:
+async def _handle_instagram_popups_best_effort(page) -> None:
+    candidates = [
+        "button:has-text('Autoriser tous les cookies')",
+        "button:has-text('Tout accepter')",
+        "button:has-text('Accepter')",
+        "button:has-text('Allow all cookies')",
+        "button:has-text('Accept all')",
+        "button:has-text('Not Now')",
+        "button:has-text('Plus tard')",
+        "button:has-text('Ignorer')",
+    ]
+    for _ in range(3):
+        for sel in candidates:
+            try:
+                btn = await page.query_selector(sel)
+                if btn:
+                    await btn.click()
+                    await page.wait_for_timeout(700)
+            except Exception:
+                pass
+        await page.wait_for_timeout(300)
+
+
+async def _find_instagram_links_list(page, query: str, *, max_results: int = 5) -> list[str]:
+    # Aller sur IG (si pas loggué, blocage fréquent)
+    await page.goto("https://www.instagram.com/", wait_until="domcontentloaded", timeout=60000)
+    await page.wait_for_timeout(1500)
+    await _handle_instagram_popups_best_effort(page)
+
+    # Trouver un input de recherche (IG change souvent ses sélecteurs)
+    search_selectors = [
+        "input[aria-label='Search input']",
+        "input[placeholder*='Rechercher']",
+        "input[placeholder*='Search']",
+        "input[type='text']",
+    ]
+    search_input = None
+    for sel in search_selectors:
+        try:
+            el = await page.query_selector(sel)
+            if el:
+                search_input = el
+                break
+        except Exception:
+            pass
+
+    if not search_input:
+        return []
+
+    try:
+        await search_input.click()
+        await page.wait_for_timeout(300)
+        await search_input.fill(query[:80])
+        await page.wait_for_timeout(1200)
+    except Exception:
+        return []
+
+    # Souvent il faut Enter (parfois 2 fois) pour ouvrir une page / résultats
+    try:
+        await page.keyboard.press("Enter")
+        await page.wait_for_timeout(900)
+        await page.keyboard.press("Enter")
+        await page.wait_for_timeout(1200)
+    except Exception:
+        pass
+
+    await _handle_instagram_popups_best_effort(page)
+
+    results: list[str] = []
+    for _ in range(10):
+        anchors = await page.query_selector_all("a[href]")
+        for a in anchors:
+            href = await a.get_attribute("href")
+            if not href:
+                continue
+            if href.startswith("/"):
+                href = "https://www.instagram.com" + href
+            href = href.split("?")[0]
+
+            if INSTAGRAM_REEL_OR_POST_RE.match(href) and href not in results:
+                results.append(href)
+
+            if len(results) >= max_results:
+                return results
+
+        try:
+            await page.mouse.wheel(0, 1600)
+        except Exception:
+            pass
+        await page.wait_for_timeout(700)
+
+    return results
+
+
+async def add_instagram_videos_to_df(
+    df: pd.DataFrame,
+    name_col: str,
+    address_col: str,
+    headless: bool = True,
+    ig_state_path: str = "ig_state.json",
+    max_results: int = 5,
+) -> pd.DataFrame:
+    """
+    Remplit:
+    - instagram_query
+    - instagram_reel  (1er lien)
+    - instagram_video (JSON list des liens)
+    """
     df = df.copy()
     df["instagram_query"] = None
     df["instagram_reel"] = None
+    df["instagram_video"] = None  # JSON list
 
-    for i, row in df.iterrows():
-        query = build_query(
-            safe_str(row.get(name_col)),
-            safe_str(row.get(address_col)),
-            fallback=safe_str(row.get("category")),
-        )
-        df.at[i, "instagram_query"] = query
-        try:
-            df.at[i, "instagram_reel"] = find_instagram_reel_link(query)
-        except Exception:
-            df.at[i, "instagram_reel"] = None
+    storage_state = ig_state_path if ig_state_path and Path(ig_state_path).exists() else None
+    if ig_state_path and storage_state is None:
+        logging.warning("[instagram] ig_state introuvable (%s) -> sans storageState (blocage probable)", ig_state_path)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=headless)
+
+        ctx_kwargs: dict = {"viewport": {"width": 1280, "height": 720}, "locale": "fr-FR"}
+        if storage_state:
+            ctx_kwargs["storage_state"] = storage_state
+
+        context = await browser.new_context(**ctx_kwargs)
+        page = await context.new_page()
+
+        for i, row in df.iterrows():
+            query = build_query(
+                safe_str(row.get(name_col)),
+                safe_str(row.get(address_col)),
+                fallback=safe_str(row.get("category")),
+            )
+            df.at[i, "instagram_query"] = query
+
+            try:
+                links = await _find_instagram_links_list(page, query, max_results=max_results)
+
+                # fallback DuckDuckGo (ton ancien code)
+                if not links:
+                    ddg = find_instagram_reel_link(query)
+                    links = [ddg] if ddg else []
+
+                df.at[i, "instagram_reel"] = links[0] if links else None
+                df.at[i, "instagram_video"] = json.dumps(links, ensure_ascii=False) if links else None
+            except Exception as e:
+                logging.warning("[instagram] failed query=%r err=%s", query, e)
+                df.at[i, "instagram_reel"] = None
+                df.at[i, "instagram_video"] = None
+
+        await context.close()
+        await browser.close()
 
     return df
 
@@ -489,6 +633,7 @@ async def run_pipeline(
     do_geocode: bool = True,
     geocode_cache: str = "geocode_cache.csv",
     tt_state_path: str = "tt_state.json",
+    ig_state_path: str = "ig_state.json",
     headless: bool = True,
     debug_limit_rows: int | None = None,
     do_youtube: bool = True,
@@ -505,12 +650,22 @@ async def run_pipeline(
         df = add_lat_lng(df, address_col=address_col, cache_path=geocode_cache)
 
     # colonnes stables
-    for c in ["youtube_query", "youtube_video", "tiktok_query", "tiktok_video", "instagram_query", "instagram_reel"]:
+    for c in [
+        "youtube_query", "youtube_video",
+        "tiktok_query", "tiktok_video",
+        "instagram_query", "instagram_reel", "instagram_video",
+    ]:
         if c not in df.columns:
             df[c] = None
 
     if do_youtube:
-        df = await add_youtube_shorts_to_df(df, name_col=name_col, address_col=address_col, headless=headless, max_results=5)
+        df = await add_youtube_shorts_to_df(
+            df,
+            name_col=name_col,
+            address_col=address_col,
+            headless=headless,
+            max_results=5,
+        )
 
     if do_tiktok:
         df = await add_tiktok_videos_to_df(
@@ -523,20 +678,32 @@ async def run_pipeline(
         )
 
     if do_instagram:
-        df = add_instagram_reels_to_df(df, name_col=name_col, address_col=address_col)
+        df = await add_instagram_videos_to_df(
+            df,
+            name_col=name_col,
+            address_col=address_col,
+            headless=headless,
+            ig_state_path=ig_state_path,
+            max_results=5,
+        )
 
     return df
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Enrich Google excels with YouTube Shorts(list)->youtube_video + TikTok(list)->tiktok_video + Instagram.")
+    parser = argparse.ArgumentParser(
+        description="Enrich Google excels with YouTube Shorts(list)->youtube_video + TikTok(list)->tiktok_video + Instagram(list)->instagram_video."
+    )
     parser.add_argument("--root", default=".", help="Root folder containing subfolders with google*.xlsx")
     parser.add_argument("--name-col", required=True, help="Column name containing the place name")
     parser.add_argument("--address-col", required=True, help="Column name containing the address")
     parser.add_argument("--headless", action="store_true", help="Run browsers headless")
     parser.add_argument("--geocode", action="store_true", help="Also compute latitude/longitude (requires geopy)")
     parser.add_argument("--geocode-cache", default="geocode_cache.csv", help="CSV cache file for geocoding")
+
     parser.add_argument("--tt-state", default="tt_state.json", help="TikTok storage_state file")
+    parser.add_argument("--ig-state", default="ig_state.json", help="Instagram storage_state file")
+
     parser.add_argument("--debug-limit-rows", type=int, default=None, help="Limit rows before enrichment")
     parser.add_argument("--out", default="enriched.csv", help="Output CSV path")
 
@@ -554,6 +721,7 @@ def main():
             do_geocode=args.geocode,
             geocode_cache=args.geocode_cache,
             tt_state_path=args.tt_state,
+            ig_state_path=args.ig_state,
             headless=args.headless,
             debug_limit_rows=args.debug_limit_rows,
             do_youtube=(not args.no_youtube),

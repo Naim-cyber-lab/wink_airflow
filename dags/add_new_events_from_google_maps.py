@@ -36,7 +36,9 @@ DAG_DOC = r"""
   - tiktok_query
   - tiktok_video = JSON list (textfield)
 - Instagram:
-  - instagram_query / instagram_reel
+  - instagram_query
+  - instagram_reel (first)
+  - instagram_video = JSON list (preferred)
 """
 
 POSTAL_RE = re.compile(r"\b(\d{5})\b")
@@ -110,6 +112,7 @@ def _build_bio(
     tiktok_video_json: str | None,
     instagram_query: str | None,
     instagram_reel: str | None,
+    instagram_video_json: str | None,
 ) -> str:
     base = safe_str(old_bio)
     lines = [base] if base else []
@@ -148,7 +151,20 @@ def _build_bio(
                 lines.append(bullet)
 
     add_line("Instagram query", instagram_query)
+
+    # On garde "Instagram Reel" (compat)
     add_line("Instagram Reel", instagram_reel)
+
+    # Préfère la liste instagram_video si dispo
+    ig_list = _json_preview_list(instagram_video_json)
+    if ig_list:
+        add_line("Instagram (first)", ig_list[0])
+        if "Instagram (list):" not in base:
+            lines.append("Instagram (list):")
+        for u in ig_list:
+            bullet = f"- {u}"
+            if bullet not in base:
+                lines.append(bullet)
 
     return "\n".join([l for l in lines if l]).strip()
 
@@ -190,6 +206,7 @@ def enrich_and_export_csv(**context):
 
     headless = bool(params.get("headless", True))
     tt_state_path = params.get("tt_state_path")
+    ig_state_path = params.get("ig_state_path")
 
     # DAG params (UI Trigger)
     do_youtube = bool(params.get("do_youtube", True))
@@ -213,6 +230,7 @@ def enrich_and_export_csv(**context):
             do_geocode=do_geocode,
             geocode_cache=geocode_cache,
             tt_state_path=tt_state_path,
+            ig_state_path=ig_state_path,
             headless=headless,
             debug_limit_rows=debug_limit_rows,
             do_youtube=do_youtube,
@@ -221,7 +239,6 @@ def enrich_and_export_csv(**context):
         )
     )
 
-    # Colonnes attendues
     expected = [
         "category",
         "source_folder",
@@ -234,6 +251,7 @@ def enrich_and_export_csv(**context):
         "tiktok_video",
         "instagram_query",
         "instagram_reel",
+        "instagram_video",
     ]
     for col in expected:
         if col not in df.columns:
@@ -304,13 +322,14 @@ def upsert_events_from_csv(**context):
             website = safe_str(row.get(website_col)) or None
 
             youtube_query = safe_str(row.get("youtube_query")) or None
-            youtube_video = safe_str(row.get("youtube_video")) or None  # ✅ JSON list shorts
+            youtube_video = safe_str(row.get("youtube_video")) or None
 
             tiktok_query = safe_str(row.get("tiktok_query")) or None
-            tiktok_video = safe_str(row.get("tiktok_video")) or None    # ✅ JSON list videos
+            tiktok_video = safe_str(row.get("tiktok_video")) or None
 
             instagram_query = safe_str(row.get("instagram_query")) or None
             instagram_reel = safe_str(row.get("instagram_reel")) or None
+            instagram_video = safe_str(row.get("instagram_video")) or None
 
             lat = row.get("latitude", None)
             lon = row.get("longitude", None)
@@ -339,6 +358,7 @@ def upsert_events_from_csv(**context):
                     tiktok_video_json=tiktok_video,
                     instagram_query=instagram_query,
                     instagram_reel=instagram_reel,
+                    instagram_video_json=instagram_video,
                 )
 
                 update_map: dict[str, object] = {}
@@ -374,6 +394,8 @@ def upsert_events_from_csv(**context):
                     update_map["instagram_query"] = instagram_query
                 if "instagram_reel" in cols and instagram_reel:
                     update_map["instagram_reel"] = instagram_reel
+                if "instagram_video" in cols and instagram_video:
+                    update_map["instagram_video"] = instagram_video
 
                 if "category" in cols and category:
                     update_map["category"] = category
@@ -395,6 +417,7 @@ def upsert_events_from_csv(**context):
                 tiktok_video_json=tiktok_video,
                 instagram_query=instagram_query,
                 instagram_reel=instagram_reel,
+                instagram_video_json=instagram_video,
             )
 
             insert_map: dict[str, object] = {}
@@ -451,6 +474,8 @@ def upsert_events_from_csv(**context):
                 insert_map["instagram_query"] = instagram_query
             if "instagram_reel" in cols:
                 insert_map["instagram_reel"] = instagram_reel
+            if "instagram_video" in cols:
+                insert_map["instagram_video"] = instagram_video
 
             if "category" in cols:
                 insert_map["category"] = category
@@ -489,7 +514,7 @@ with DAG(
     params={
         "do_youtube": Param(True, type="boolean", title="Inclure YouTube", description="Scraper YouTube Shorts -> youtube_video (JSON list)"),
         "do_tiktok": Param(True, type="boolean", title="Inclure TikTok", description="Scraper TikTok -> tiktok_video (JSON list)"),
-        "do_instagram": Param(True, type="boolean", title="Inclure Instagram", description="Scraper Instagram (best effort)"),
+        "do_instagram": Param(True, type="boolean", title="Inclure Instagram", description="Scraper Instagram via Playwright (+fallback)"),
         "debug_limit_rows": Param(5, type=["integer", "null"], title="Debug limit rows", description="Nombre max de lignes (null = tout)"),
     },
 ) as dag:
@@ -507,6 +532,7 @@ with DAG(
             "website_col": "MRe4xd href",
             "headless": True,
             "tt_state_path": "/opt/airflow/data/tt_state.json",
+            "ig_state_path": "/opt/airflow/data/ig_state.json",
             "do_geocode": True,
             "geocode_cache": "/opt/airflow/data/geocode_cache.csv",
             "output_dir": "/opt/airflow/data",
