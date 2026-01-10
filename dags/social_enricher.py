@@ -8,7 +8,7 @@ import logging
 import re
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, unquote
 from urllib.request import Request, urlopen
 
 import pandas as pd
@@ -29,13 +29,11 @@ GOOGLE_FILE_RE = re.compile(r"^google(?: \(\d+\))?\.xlsx$", re.IGNORECASE)
 YOUTUBE_SHORTS_URL_RE = re.compile(r"^https?://(www\.)?youtube\.com/shorts/[^/?#]+", re.IGNORECASE)
 TIKTOK_VIDEO_URL_RE = re.compile(r"^https?://(www\.)?tiktok\.com/@[^/]+/video/\d+", re.IGNORECASE)
 
-# DuckDuckGo fallback regex
-INSTAGRAM_REEL_RE = re.compile(
-    r"https?://(?:www\.)?instagram\.com/(?:reel|reels)/[A-Za-z0-9_\-]+/?",
+# Instagram
+INSTAGRAM_ANY_VIDEO_RE = re.compile(
+    r"^https?://(?:www\.)?instagram\.com/(?:reel|reels|p)/[A-Za-z0-9_\-]+/?$",
     re.IGNORECASE,
 )
-
-# Playwright scraping regex (on accepte /p/ en plus, car parfois la vidéo est un post)
 INSTAGRAM_REEL_OR_POST_RE = re.compile(
     r"^https?://(?:www\.)?instagram\.com/(?:reel|reels|p)/[A-Za-z0-9_\-]+/?",
     re.IGNORECASE,
@@ -87,6 +85,20 @@ def build_query(name, address, fallback=None) -> str:
     fallback = safe_str(fallback)
     base = name if name else fallback
     return f"{base} {address}".strip()
+
+
+def normalize_instagram_url(u: str) -> str:
+    u = (u or "").strip()
+    if not u:
+        return ""
+    u = u.split("#")[0].split("?")[0].rstrip("/")
+    if u.startswith("http://"):
+        u = "https://" + u[len("http://") :]
+    if u.startswith("https://instagram.com/"):
+        u = "https://www.instagram.com/" + u[len("https://instagram.com/") :]
+    if u.startswith("https://www.instagram.com//"):
+        u = u.replace("https://www.instagram.com//", "https://www.instagram.com/")
+    return u + "/"
 
 
 # ============================================================
@@ -431,8 +443,7 @@ async def add_tiktok_videos_to_df(
 
 
 # ============================================================
-# 5) Instagram
-#    Objectif: remplir instagram_video (JSON list) + logs
+# 5) Instagram (Playwright + fallback DDG corrigé)
 # ============================================================
 
 def _duckduckgo_html_search(query: str, timeout: int = 20) -> str:
@@ -440,30 +451,68 @@ def _duckduckgo_html_search(query: str, timeout: int = 20) -> str:
     req = Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120 Safari/537.36"
+            )
         },
     )
     with urlopen(req, timeout=timeout) as resp:
         return resp.read().decode("utf-8", errors="ignore")
 
 
-def find_instagram_reel_link(query: str) -> str | None:
-    try:
-        html = _duckduckgo_html_search(f"site:instagram.com/reel {query}")
-    except (HTTPError, URLError, TimeoutError, Exception):
-        return None
+def _extract_instagram_links_from_ddg_html(html: str, max_results: int = 5) -> list[str]:
+    """
+    DDG /html/ renvoie souvent des liens intermédiaires:
+      /l/?uddg=<URLENCODED>
+    On décode uddg et on filtre instagram reel/reels/p.
+    """
+    links: list[str] = []
 
-    m = INSTAGRAM_REEL_RE.search(html)
-    if m:
-        return m.group(0)
+    # 1) uddg=... (cas le plus courant)
+    for m in re.finditer(r"uddg=([^&\"'>\s]+)", html):
+        try:
+            decoded = unquote(m.group(1))
+            decoded = normalize_instagram_url(decoded)
+            if INSTAGRAM_ANY_VIDEO_RE.match(decoded) and decoded not in links:
+                links.append(decoded)
+                if len(links) >= max_results:
+                    return links
+        except Exception:
+            continue
 
-    try:
-        html = _duckduckgo_html_search(f"site:instagram.com/reels {query}")
-    except Exception:
-        return None
+    # 2) parfois URL en clair
+    for m in re.finditer(r"https?://(?:www\.)?instagram\.com/(?:reel|reels|p)/[A-Za-z0-9_\-]+/?", html, re.I):
+        u = normalize_instagram_url(m.group(0))
+        if INSTAGRAM_ANY_VIDEO_RE.match(u) and u not in links:
+            links.append(u)
+            if len(links) >= max_results:
+                return links
 
-    m = INSTAGRAM_REEL_RE.search(html)
-    return m.group(0) if m else None
+    return links
+
+
+def find_instagram_links_ddg(query: str, max_results: int = 5) -> list[str]:
+    """
+    Cherche sur DDG des pages IG vidéo liées au lieu.
+    """
+    queries = [
+        f'site:instagram.com (reel OR reels OR p) "{query}"',
+        f"site:instagram.com/reel {query}",
+        f"site:instagram.com/p {query}",
+    ]
+
+    for q in queries:
+        try:
+            html = _duckduckgo_html_search(q)
+        except (HTTPError, URLError, TimeoutError, Exception):
+            continue
+
+        links = _extract_instagram_links_from_ddg_html(html, max_results=max_results)
+        if links:
+            return links
+
+    return []
 
 
 async def _handle_instagram_popups_best_effort(page) -> None:
@@ -494,6 +543,7 @@ async def _find_instagram_links_list(page, query: str, *, max_results: int = 5) 
     await page.wait_for_timeout(1500)
     await _handle_instagram_popups_best_effort(page)
 
+    # NB: IG change souvent ses selectors => best effort
     search_selectors = [
         "input[aria-label='Search input']",
         "input[placeholder*='Rechercher']",
@@ -540,7 +590,7 @@ async def _find_instagram_links_list(page, query: str, *, max_results: int = 5) 
                 continue
             if href.startswith("/"):
                 href = "https://www.instagram.com" + href
-            href = href.split("?")[0]
+            href = normalize_instagram_url(href)
 
             if INSTAGRAM_REEL_OR_POST_RE.match(href) and href not in results:
                 results.append(href)
@@ -576,7 +626,7 @@ async def add_instagram_videos_to_df(
 
     storage_state = ig_state_path if ig_state_path and Path(ig_state_path).exists() else None
     if ig_state_path and storage_state is None:
-        logging.warning("[instagram] ig_state introuvable (%s) -> sans storageState (blocage probable)", ig_state_path)
+        logging.warning("[instagram] ig_state introuvable (%s) -> sans storageState (Playwright blocage probable)", ig_state_path)
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
@@ -597,16 +647,19 @@ async def add_instagram_videos_to_df(
             df.at[i, "instagram_query"] = query
 
             try:
+                # 1) Try Playwright IG
                 links = await _find_instagram_links_list(page, query, max_results=max_results)
-
                 logging.info("[instagram] query=%r found=%s", query, len(links))
                 if links:
                     logging.info("[instagram] first=%s", links[0])
 
+                # 2) Fallback DDG (corrigé)
                 if not links:
-                    ddg = find_instagram_reel_link(query)
-                    logging.info("[instagram] fallback DDG hit=%s", bool(ddg))
-                    links = [ddg] if ddg else []
+                    ddg_links = find_instagram_links_ddg(query, max_results=max_results)
+                    logging.info("[instagram] fallback DDG found=%s", len(ddg_links))
+                    if ddg_links:
+                        logging.info("[instagram] fallback first=%s", ddg_links[0])
+                    links = ddg_links
 
                 df.at[i, "instagram_video"] = json.dumps(links, ensure_ascii=False) if links else None
 
@@ -653,7 +706,7 @@ async def run_pipeline(
     if do_geocode:
         df = add_lat_lng(df, address_col=address_col, cache_path=geocode_cache)
 
-    # Colonnes stables (créées si absentes)
+    # Colonnes stables
     for c in [
         "youtube_query", "youtube_video",
         "tiktok_query", "tiktok_video",
