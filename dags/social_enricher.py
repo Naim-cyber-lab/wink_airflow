@@ -7,7 +7,6 @@ import json
 import logging
 import re
 from pathlib import Path
-from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus, unquote
 from urllib.request import Request, urlopen
 
@@ -56,6 +55,25 @@ def safe_str(x) -> str:
     except Exception:
         pass
     return str(x).strip()
+
+
+def _norm_col(s: str) -> str:
+    # normalisation agressive: lower + collapse spaces
+    return re.sub(r"\s+", " ", safe_str(s).lower()).strip()
+
+
+def resolve_col(df: pd.DataFrame, desired: str) -> str | None:
+    """
+    Résout un nom de colonne même si l'Excel contient des doubles espaces, etc.
+    Ex: "rllt__details  4" -> "rllt__details 4"
+    """
+    desired_norm = _norm_col(desired)
+    # exact match
+    if desired in df.columns:
+        return desired
+    # normalized match
+    mapping = {_norm_col(c): c for c in df.columns}
+    return mapping.get(desired_norm)
 
 
 def file_index(path: Path) -> int:
@@ -194,8 +212,9 @@ def add_lat_lng(
 
     df = df.copy()
 
-    if address_col not in df.columns:
-        raise ValueError(f"address_col='{address_col}' introuvable dans le dataframe.")
+    addr_col = resolve_col(df, address_col)
+    if not addr_col:
+        raise ValueError(f"address_col='{address_col}' introuvable dans le dataframe (colonnes={list(df.columns)[:30]}...).")
 
     def normalize(a: str) -> str:
         a = safe_str(a)
@@ -206,7 +225,7 @@ def add_lat_lng(
             a = f"{a}, France"
         return a
 
-    df["_addr"] = df[address_col].astype(str).fillna("").map(normalize)
+    df["_addr"] = df[addr_col].astype(str).fillna("").map(normalize)
 
     cache_file = Path(cache_path)
     cache_file.parent.mkdir(parents=True, exist_ok=True)
@@ -328,13 +347,18 @@ async def add_youtube_shorts_to_df(df: pd.DataFrame, name_col: str, address_col:
     df["youtube_query"] = None
     df["youtube_video"] = None
 
+    ncol = resolve_col(df, name_col)
+    acol = resolve_col(df, address_col)
+    if not ncol or not acol:
+        raise ValueError(f"[youtube] columns not found: name_col={name_col} address_col={address_col}")
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
         context = await browser.new_context(viewport={"width": 1280, "height": 720}, locale="fr-FR")
         page = await context.new_page()
 
         for i, row in df.iterrows():
-            query = build_query(safe_str(row.get(name_col)), safe_str(row.get(address_col)), fallback=safe_str(row.get("category")))
+            query = build_query(safe_str(row.get(ncol)), safe_str(row.get(acol)), fallback=safe_str(row.get("category")))
             df.at[i, "youtube_query"] = query
 
             try:
@@ -400,6 +424,11 @@ async def add_tiktok_videos_to_df(df: pd.DataFrame, name_col: str, address_col: 
     df["tiktok_query"] = None
     df["tiktok_video"] = None
 
+    ncol = resolve_col(df, name_col)
+    acol = resolve_col(df, address_col)
+    if not ncol or not acol:
+        raise ValueError(f"[tiktok] columns not found: name_col={name_col} address_col={address_col}")
+
     storage_state = tt_state_path if tt_state_path and Path(tt_state_path).exists() else None
     if tt_state_path and storage_state is None:
         logging.warning("[tiktok] tt_state introuvable (%s) -> sans storageState", tt_state_path)
@@ -415,7 +444,7 @@ async def add_tiktok_videos_to_df(df: pd.DataFrame, name_col: str, address_col: 
         page = await context.new_page()
 
         for i, row in df.iterrows():
-            query = build_query(safe_str(row.get(name_col)), safe_str(row.get(address_col)), fallback=safe_str(row.get("category")))
+            query = build_query(safe_str(row.get(ncol)), safe_str(row.get(acol)), fallback=safe_str(row.get("category")))
             df.at[i, "tiktok_query"] = query
 
             try:
@@ -457,7 +486,6 @@ def _duckduckgo_html_search(query: str, timeout: int = 25) -> str:
 
 
 def _duckduckgo_lite_search(query: str, timeout: int = 25) -> str:
-    # Lite endpoint: souvent plus simple / moins filtré
     url = "https://lite.duckduckgo.com/lite/?q=" + quote_plus(query)
     return _http_get(url, timeout=timeout)
 
@@ -465,7 +493,7 @@ def _duckduckgo_lite_search(query: str, timeout: int = 25) -> str:
 def _extract_instagram_links_from_html(html: str, max_results: int = 5) -> list[str]:
     links: list[str] = []
 
-    # (1) DDG redirect param uddg=
+    # (1) DDG redirect: uddg=
     for m in re.finditer(r"uddg=([^&\"'>\s]+)", html):
         try:
             decoded = unquote(m.group(1))
@@ -477,7 +505,7 @@ def _extract_instagram_links_from_html(html: str, max_results: int = 5) -> list[
         except Exception:
             continue
 
-    # (2) Direct IG urls in HTML
+    # (2) direct urls
     for m in re.finditer(INSTAGRAM_REEL_OR_POST_RE, html):
         u = normalize_instagram_url(m.group(0))
         if INSTAGRAM_ANY_VIDEO_RE.match(u) and u not in links:
@@ -496,32 +524,24 @@ def _build_ig_search_queries(place_name: str, city_or_region: str | None) -> lis
     if city_or_region:
         queries.extend([
             f'site:instagram.com (reel OR reels OR p) "{place_name}" "{city_or_region}"',
-            f'site:instagram.com "{place_name}" "{city_or_region}" instagram',
             f'{place_name} "{city_or_region}" site:instagram.com',
             f'{place_name} instagram "{city_or_region}"',
         ])
 
-    # always include "no city" variants
     queries.extend([
         f'site:instagram.com (reel OR reels OR p) "{place_name}"',
-        f'site:instagram.com "{place_name}" instagram',
-        f'{place_name} site:instagram.com',
+        f'{place_name} site:instagram.com reel',
+        f'{place_name} instagram site:instagram.com',
     ])
     return queries
 
 
 def find_instagram_links_search(place_name: str, city_or_region: str | None, max_results: int = 5) -> list[str]:
-    """
-    Fallback search: try DDG html then DDG lite.
-    If both blocked/empty, logs html_len+sample to detect challenges.
-    """
     place_name = safe_str(place_name)
     if not place_name:
         return []
 
-    queries = _build_ig_search_queries(place_name, city_or_region)
-
-    for q in queries:
+    for q in _build_ig_search_queries(place_name, city_or_region):
         # DDG html
         try:
             html = _duckduckgo_html_search(q)
@@ -541,7 +561,6 @@ def find_instagram_links_search(place_name: str, city_or_region: str | None, max
                 logging.info("[instagram][ddg-lite] q=%r -> %s links", q, len(links))
                 return links
             logging.info("[instagram][ddg-lite] q=%r -> 0 links (html_len=%s)", q, len(html))
-            # log small sample once (useful to see "captcha"/"too many requests")
             sample = re.sub(r"\s+", " ", html[:250])
             logging.info("[instagram][ddg-lite-sample] %r", sample)
         except Exception as e:
@@ -574,9 +593,6 @@ async def _handle_instagram_popups_best_effort(page) -> None:
 
 
 async def _find_instagram_links_list(page, query: str, *, max_results: int = 5) -> list[str]:
-    """
-    Best-effort Instagram UI scraping (usually blocked without ig_state).
-    """
     await page.goto("https://www.instagram.com/", wait_until="domcontentloaded", timeout=60000)
     await page.wait_for_timeout(1500)
     await _handle_instagram_popups_best_effort(page)
@@ -652,18 +668,14 @@ async def add_instagram_videos_to_df(
     ig_state_path: str = "ig_state.json",
     max_results: int = 5,
 ) -> pd.DataFrame:
-    """
-    Fill:
-      - instagram_query (UI query, debug)
-      - instagram_video : JSON list of IG video URLs (reel/reels/p)
-
-    Strategy:
-      1) Try Playwright UI (may be blocked)
-      2) Fallback search (DDG html + lite): place_name + city/region if possible
-    """
     df = df.copy()
     df["instagram_query"] = None
     df["instagram_video"] = None
+
+    ncol = resolve_col(df, name_col)
+    acol = resolve_col(df, address_col)
+    if not ncol or not acol:
+        raise ValueError(f"[instagram] columns not found: name_col={name_col} address_col={address_col}")
 
     storage_state = ig_state_path if ig_state_path and Path(ig_state_path).exists() else None
     if ig_state_path and storage_state is None:
@@ -680,8 +692,8 @@ async def add_instagram_videos_to_df(
         page = await context.new_page()
 
         for i, row in df.iterrows():
-            place_name = safe_str(row.get(name_col))
-            address = safe_str(row.get(address_col))
+            place_name = safe_str(row.get(ncol))
+            address = safe_str(row.get(acol))
 
             query_ui = build_query(place_name, address, fallback=safe_str(row.get("category")))
             df.at[i, "instagram_query"] = query_ui
@@ -700,7 +712,6 @@ async def add_instagram_videos_to_df(
 
             # 2) Search fallback
             if not links:
-                # pick best location string from data if available
                 city_or_region = None
                 if "city" in df.columns:
                     city_or_region = safe_str(row.get("city")) or None
@@ -750,6 +761,9 @@ async def run_pipeline(
     if debug_limit_rows is not None:
         df = df.head(int(debug_limit_rows)).copy()
         logging.warning("🧪 [debug] Limitation DF à %s lignes", len(df))
+
+    # log colonnes (debug)
+    logging.info("🧾 [df] columns(sample)=%s", list(df.columns)[:40])
 
     if do_geocode:
         df = add_lat_lng(df, address_col=address_col, cache_path=geocode_cache)
