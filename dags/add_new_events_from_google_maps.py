@@ -1,5 +1,3 @@
-# dags/add_new_events_from_google_maps.py
-
 from __future__ import annotations
 
 import asyncio
@@ -26,24 +24,6 @@ from social_enricher import run_pipeline  # type: ignore
 PARIS_TZ = ZoneInfo("Europe/Paris")
 DB_CONN_ID = "my_postgres"
 
-DAG_DOC = r"""
-# 🎬 Import Events depuis Google Excels + enrichissement social
-
-- YouTube:
-  - youtube_query
-  - youtube_video = JSON list de shorts (textfield)
-- TikTok:
-  - tiktok_query
-  - tiktok_video = JSON list (textfield)
-- Instagram:
-  - instagram_query
-  - instagram_video = JSON list (preferred)
-
-Logs:
-- enrich: df.head() ciblé + stats non-empty
-- db: SKIP / INSERT / UPDATE / NOOP + colonnes modifiées + stats médias
-"""
-
 POSTAL_RE = re.compile(r"\b(\d{5})\b")
 
 
@@ -63,15 +43,6 @@ def extract_postal_code(address: str) -> str | None:
         return None
     m = POSTAL_RE.search(address)
     return m.group(1) if m else None
-
-
-def guess_city(address: str) -> str | None:
-    if not address:
-        return None
-    a = address.lower()
-    if "paris" in a:
-        return "Paris"
-    return None
 
 
 def _get_table_columns(cursor, table: str) -> set[str]:
@@ -103,10 +74,6 @@ def _json_preview_list(json_list_str: str | None, limit: int = 10) -> list[str]:
         pass
     return []
 
-
-# -------------------------
-# LOG HELPERS
-# -------------------------
 
 def _short(s: str | None, n: int = 80) -> str:
     s = safe_str(s)
@@ -143,70 +110,25 @@ def _count_non_empty(series: pd.Series | None) -> int:
     return int(series.fillna("").astype(str).str.strip().ne("").sum())
 
 
-# -------------------------
-# BIO builder
-# -------------------------
+def _parse_price(v) -> float | None:
+    """
+    Convert rllt__details 2 -> float
+    Accept: "€€", "10-20 €", "15", "15.5", "15,5"
+    """
+    s = safe_str(v)
+    if not s:
+        return None
 
-def _build_bio(
-    old_bio: str,
-    *,
-    category: str | None,
-    website: str | None,
-    youtube_query: str | None,
-    youtube_video_json: str | None,
-    tiktok_query: str | None,
-    tiktok_video_json: str | None,
-    instagram_query: str | None,
-    instagram_video_json: str | None,
-) -> str:
-    base = safe_str(old_bio)
-    lines = [base] if base else []
-
-    def add_line(label: str, value: str | None):
-        v = safe_str(value)
-        if not v:
-            return
-        line = f"{label}: {v}"
-        if line not in base:
-            lines.append(line)
-
-    add_line("Category", category)
-    add_line("Website", website)
-
-    add_line("YouTube query", youtube_query)
-    yt_list = _json_preview_list(youtube_video_json)
-    if yt_list:
-        add_line("YouTube Shorts (first)", yt_list[0])
-        if "YouTube Shorts (list):" not in base:
-            lines.append("YouTube Shorts (list):")
-        for u in yt_list:
-            bullet = f"- {u}"
-            if bullet not in base:
-                lines.append(bullet)
-
-    add_line("TikTok query", tiktok_query)
-    tt_list = _json_preview_list(tiktok_video_json)
-    if tt_list:
-        add_line("TikTok (first)", tt_list[0])
-        if "TikTok (list):" not in base:
-            lines.append("TikTok (list):")
-        for u in tt_list:
-            bullet = f"- {u}"
-            if bullet not in base:
-                lines.append(bullet)
-
-    add_line("Instagram query", instagram_query)
-    ig_list = _json_preview_list(instagram_video_json)
-    if ig_list:
-        add_line("Instagram (first)", ig_list[0])
-        if "Instagram (list):" not in base:
-            lines.append("Instagram (list):")
-        for u in ig_list:
-            bullet = f"- {u}"
-            if bullet not in base:
-                lines.append(bullet)
-
-    return "\n".join([l for l in lines if l]).strip()
+    # normalize decimal comma
+    s = s.replace(",", ".")
+    # extract first number
+    m = re.search(r"(\d+(?:\.\d+)?)", s)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except Exception:
+        return None
 
 
 def _exec_insert(cursor, table: str, data: dict[str, object]):
@@ -222,10 +144,7 @@ def _exec_insert(cursor, table: str, data: dict[str, object]):
 
 
 def _exec_update(cursor, table: str, event_id: int, data: dict[str, object]):
-    assignments = [
-        sql.SQL("{} = {}").format(sql.Identifier(k), sql.Placeholder())
-        for k in data.keys()
-    ]
+    assignments = [sql.SQL("{} = {}").format(sql.Identifier(k), sql.Placeholder()) for k in data.keys()]
     query = sql.SQL("UPDATE {t} SET {assignments} WHERE id = %s").format(
         t=sql.Identifier(table),
         assignments=sql.SQL(", ").join(assignments),
@@ -278,6 +197,7 @@ def enrich_and_export_csv(**context):
         )
     )
 
+    # Ensure columns
     expected = [
         "category",
         "source_folder",
@@ -295,7 +215,6 @@ def enrich_and_export_csv(**context):
         if col not in df.columns:
             df[col] = None
 
-    # 🔎 DEBUG df.head (voir si instagram_video est vide)
     cols_debug = [
         "category",
         "source_folder",
@@ -324,16 +243,21 @@ def enrich_and_export_csv(**context):
 
 
 # ---------------------------------------------------------------------
-# Task 2: upsert (with detailed logs)
+# Task 2: upsert (bio + price mapping fixed)
 # ---------------------------------------------------------------------
 def upsert_events_from_csv(**context):
     params = context["params"]
 
     name_col = params["name_col"]
     address_col = params["address_col"]
+
+    # ✅ mappings you requested
+    bio_col = params.get("bio_col", "rllt__details 4")
+    price_col = params.get("price_col", "rllt__details 2")
+
     website_col = params.get("website_col", "MRe4xd href")
 
-    region_default = params.get("region_default", "Paris")
+    region_default = params.get("region_default", "France")
     use_category_as_region = bool(params.get("use_category_as_region", True))
 
     creator_winker_id = int(params.get("creator_winker_id", 116))
@@ -368,29 +292,31 @@ def upsert_events_from_csv(**context):
     try:
         cols = _get_table_columns(cursor, "profil_event")
         logging.info("🧱 [db] profil_event columns detected: %s cols", len(cols))
-        logging.info("🧪 [db] has instagram_video column? %s", "instagram_video" in cols)
+        logging.info("🧪 [db] has instagram_video? %s | has price? %s | has bioEvent? %s",
+                     "instagram_video" in cols, "price" in cols, "bioEvent" in cols)
 
         for _, row in df.iterrows():
             titre = safe_str(row.get(name_col))
             adresse = safe_str(row.get(address_col))
             if not titre or not adresse:
                 skipped += 1
-                _log_row("SKIP", titre=titre, adresse=adresse, details="missing titre or adresse")
+                _log_row("SKIP", titre=titre, adresse=adresse, details="missing titre/adresse")
                 continue
 
             category = safe_str(row.get("category")) or None
-            region = (category if (use_category_as_region and category) else safe_str(region_default)) or "Paris"
-            city = guess_city(adresse) or "Paris"
+            region = (category if (use_category_as_region and category) else safe_str(region_default)) or None
             code_postal = extract_postal_code(adresse)
 
             website = safe_str(row.get(website_col)) or None
 
+            # ✅ requested mappings
+            bio_value = safe_str(row.get(bio_col)) or None
+            price_value = _parse_price(row.get(price_col))
+
             youtube_query = safe_str(row.get("youtube_query")) or None
             youtube_video = safe_str(row.get("youtube_video")) or None
-
             tiktok_query = safe_str(row.get("tiktok_query")) or None
             tiktok_video = safe_str(row.get("tiktok_video")) or None
-
             instagram_query = safe_str(row.get("instagram_query")) or None
             instagram_video = safe_str(row.get("instagram_video")) or None
 
@@ -405,7 +331,7 @@ def upsert_events_from_csv(**context):
 
             cursor.execute(
                 """
-                SELECT id, "bioEvent", website, lat, lon
+                SELECT id, "bioEvent", price, website, lat, lon
                 FROM profil_event
                 WHERE titre = %s AND adresse = %s
                 LIMIT 1
@@ -415,24 +341,17 @@ def upsert_events_from_csv(**context):
             existing = cursor.fetchone()
 
             if existing:
-                event_id, old_bio, old_website, old_lat, old_lon = existing
-
-                new_bio = _build_bio(
-                    old_bio or "",
-                    category=category,
-                    website=website or old_website,
-                    youtube_query=youtube_query,
-                    youtube_video_json=youtube_video,
-                    tiktok_query=tiktok_query,
-                    tiktok_video_json=tiktok_video,
-                    instagram_query=instagram_query,
-                    instagram_video_json=instagram_video,
-                )
+                event_id, old_bio, old_price, old_website, old_lat, old_lon = existing
 
                 update_map: dict[str, object] = {}
 
-                if "bioEvent" in cols and new_bio and new_bio != (old_bio or ""):
-                    update_map["bioEvent"] = new_bio
+                # ✅ bioEvent = rllt__details 4
+                if "bioEvent" in cols and bio_value and bio_value != (old_bio or ""):
+                    update_map["bioEvent"] = bio_value
+
+                # ✅ price = rllt__details 2 (float)
+                if "price" in cols and price_value is not None and (old_price is None or float(old_price) != float(price_value)):
+                    update_map["price"] = float(price_value)
 
                 if "website" in cols and (old_website is None and website is not None):
                     update_map["website"] = website
@@ -444,8 +363,6 @@ def upsert_events_from_csv(**context):
 
                 if "region" in cols and region:
                     update_map["region"] = region
-                if "city" in cols and city:
-                    update_map["city"] = city
                 if "codePostal" in cols and code_postal:
                     update_map["codePostal"] = code_postal
 
@@ -464,9 +381,6 @@ def upsert_events_from_csv(**context):
                 if "instagram_video" in cols and instagram_video:
                     update_map["instagram_video"] = instagram_video
 
-                if "category" in cols and category:
-                    update_map["category"] = category
-
                 if update_map:
                     _exec_update(cursor, "profil_event", int(event_id), update_map)
                     updated += 1
@@ -475,7 +389,7 @@ def upsert_events_from_csv(**context):
                         event_id=int(event_id),
                         titre=titre,
                         adresse=adresse,
-                        details=f"cols={sorted(update_map.keys())} | {media_info}",
+                        details=f"cols={sorted(update_map.keys())} | price={price_value} | {media_info}",
                     )
                 else:
                     noops += 1
@@ -484,24 +398,11 @@ def upsert_events_from_csv(**context):
                         event_id=int(event_id),
                         titre=titre,
                         adresse=adresse,
-                        details=f"no column changed | {media_info}",
+                        details=f"no column changed | price={price_value} | {media_info}",
                     )
-
                 continue
 
             # INSERT
-            bio_event = _build_bio(
-                "",
-                category=category,
-                website=website,
-                youtube_query=youtube_query,
-                youtube_video_json=youtube_video,
-                tiktok_query=tiktok_query,
-                tiktok_video_json=tiktok_video,
-                instagram_query=instagram_query,
-                instagram_video_json=instagram_video,
-            )
-
             insert_map: dict[str, object] = {}
 
             if "titre" in cols:
@@ -511,20 +412,19 @@ def upsert_events_from_csv(**context):
             if "adresse" in cols:
                 insert_map["adresse"] = adresse
 
-            if "region" in cols:
+            if "region" in cols and region:
                 insert_map["region"] = region
-            if "city" in cols:
-                insert_map["city"] = city
-            if "codePostal" in cols:
+            if "codePostal" in cols and code_postal:
                 insert_map["codePostal"] = code_postal
 
+            # ✅ bioEvent + price
             if "bioEvent" in cols:
-                insert_map["bioEvent"] = bio_event
+                insert_map["bioEvent"] = bio_value
+            if "price" in cols:
+                insert_map["price"] = float(price_value) if price_value is not None else None
+
             if "website" in cols:
                 insert_map["website"] = website
-
-            if "nbStories" in cols:
-                insert_map["nbStories"] = 0
 
             if "creatorWinker_id" in cols:
                 insert_map["creatorWinker_id"] = creator_winker_id
@@ -557,9 +457,6 @@ def upsert_events_from_csv(**context):
             if "instagram_video" in cols:
                 insert_map["instagram_video"] = instagram_video
 
-            if "category" in cols:
-                insert_map["category"] = category
-
             if not insert_map:
                 raise RuntimeError("Aucune colonne détectée pour insert dans profil_event (schéma inattendu).")
 
@@ -570,7 +467,7 @@ def upsert_events_from_csv(**context):
                 event_id=int(new_id),
                 titre=titre,
                 adresse=adresse,
-                details=f"cols={sorted(insert_map.keys())} | {media_info}",
+                details=f"cols={sorted(insert_map.keys())} | price={price_value} | {media_info}",
             )
 
         connection.commit()
@@ -585,11 +482,7 @@ def upsert_events_from_csv(**context):
         connection.close()
 
 
-default_args = {
-    "owner": "airflow",
-    "retries": 1,
-    "retry_delay": timedelta(minutes=2),
-}
+default_args = {"owner": "airflow", "retries": 1, "retry_delay": timedelta(minutes=2)}
 
 with DAG(
     dag_id="import_events_from_google_excels_social_enricher",
@@ -599,13 +492,12 @@ with DAG(
     default_args=default_args,
     tags=["event", "import", "tiktok", "youtube", "instagram", "playwright"],
     params={
-        "do_youtube": Param(True, type="boolean", title="Inclure YouTube", description="Scraper YouTube Shorts -> youtube_video (JSON list)"),
-        "do_tiktok": Param(True, type="boolean", title="Inclure TikTok", description="Scraper TikTok -> tiktok_video (JSON list)"),
-        "do_instagram": Param(True, type="boolean", title="Inclure Instagram", description="Scraper Instagram via Playwright (+fallback)"),
-        "debug_limit_rows": Param(5, type=["integer", "null"], title="Debug limit rows", description="Nombre max de lignes (null = tout)"),
+        "do_youtube": Param(True, type="boolean"),
+        "do_tiktok": Param(True, type="boolean"),
+        "do_instagram": Param(True, type="boolean"),
+        "debug_limit_rows": Param(5, type=["integer", "null"]),
     },
 ) as dag:
-    dag.doc_md = DAG_DOC
     dag.timezone = PARIS_TZ
 
     t1 = PythonOperator(
@@ -616,7 +508,6 @@ with DAG(
             "root_folder": "/opt/airflow/data",
             "name_col": "OSrXXb",
             "address_col": "rllt__details 3",
-            "website_col": "MRe4xd href",
             "headless": True,
             "tt_state_path": "/opt/airflow/data/tt_state.json",
             "ig_state_path": "/opt/airflow/data/ig_state.json",
@@ -633,9 +524,11 @@ with DAG(
         params={
             "name_col": "OSrXXb",
             "address_col": "rllt__details 3",
+            "bio_col": "rllt__details 4",   # ✅
+            "price_col": "rllt__details 2", # ✅
             "website_col": "MRe4xd href",
             "use_category_as_region": True,
-            "region_default": "Paris",
+            "region_default": "France",
             "creator_winker_id": 116,
             "active_default": 0,
             "max_participants": 99999999,

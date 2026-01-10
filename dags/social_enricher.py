@@ -29,7 +29,7 @@ GOOGLE_FILE_RE = re.compile(r"^google(?: \(\d+\))?\.xlsx$", re.IGNORECASE)
 YOUTUBE_SHORTS_URL_RE = re.compile(r"^https?://(www\.)?youtube\.com/shorts/[^/?#]+", re.IGNORECASE)
 TIKTOK_VIDEO_URL_RE = re.compile(r"^https?://(www\.)?tiktok\.com/@[^/]+/video/\d+", re.IGNORECASE)
 
-# Instagram (accept reels/reel/p)
+# Instagram (accept reel/reels/p)
 INSTAGRAM_ANY_VIDEO_RE = re.compile(
     r"^https?://(?:www\.)?instagram\.com/(?:reel|reels|p)/[A-Za-z0-9_\-]+/?$",
     re.IGNORECASE,
@@ -39,7 +39,7 @@ INSTAGRAM_REEL_OR_POST_RE = re.compile(
     re.IGNORECASE,
 )
 
-# FR address heuristic: "75011 Paris" -> "Paris"
+# FR heuristic: "75011 Paris" -> "Paris"
 POSTAL_CITY_FR_RE = re.compile(r"\b\d{5}\s+([A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ'\- ]{2,})\b")
 
 
@@ -105,19 +105,12 @@ def normalize_instagram_url(u: str) -> str:
 
 
 def extract_city_from_address_fr(address: str) -> str | None:
-    """
-    Ex: '3 Rue Faidherbe, 75011 Paris' -> 'Paris'
-    Ex: '40 Bd ..., 75010 PARIS' -> 'PARIS'
-    Returns None if not found.
-    """
     address = safe_str(address)
     if not address:
         return None
-
     m = POSTAL_CITY_FR_RE.search(address)
     if not m:
         return None
-
     city = m.group(1).strip()
     city = re.split(r",|/|\(|\)", city)[0].strip()
     return city or None
@@ -209,7 +202,6 @@ def add_lat_lng(
         if not a or a.lower() == "nan":
             return ""
         a_low = a.lower()
-        # keep generic, don't force Paris here
         if "france" not in a_low:
             a = f"{a}, France"
         return a
@@ -224,10 +216,7 @@ def add_lat_lng(
     else:
         cache_df = pd.DataFrame(columns=["_addr", "latitude", "longitude"])
 
-    cache_map = {
-        r["_addr"]: (r["latitude"], r["longitude"])
-        for _, r in cache_df.dropna(subset=["_addr"]).iterrows()
-    }
+    cache_map = {r["_addr"]: (r["latitude"], r["longitude"]) for _, r in cache_df.dropna(subset=["_addr"]).iterrows()}
 
     geolocator = Nominatim(user_agent="wink-airflow-geocoder")
     geocode = RateLimiter(geolocator.geocode, min_delay_seconds=min_delay_seconds)
@@ -276,7 +265,7 @@ def add_lat_lng(
 
 
 # ============================================================
-# 3) YouTube Shorts => youtube_video (JSON list)
+# 3) YouTube Shorts
 # ============================================================
 
 async def _handle_youtube_consent_best_effort(page) -> None:
@@ -334,13 +323,7 @@ async def _find_youtube_shorts_list(page, query: str, *, max_results: int = 5) -
     return results
 
 
-async def add_youtube_shorts_to_df(
-    df: pd.DataFrame,
-    name_col: str,
-    address_col: str,
-    headless: bool = True,
-    max_results: int = 5,
-) -> pd.DataFrame:
+async def add_youtube_shorts_to_df(df: pd.DataFrame, name_col: str, address_col: str, headless: bool = True, max_results: int = 5) -> pd.DataFrame:
     df = df.copy()
     df["youtube_query"] = None
     df["youtube_video"] = None
@@ -351,11 +334,7 @@ async def add_youtube_shorts_to_df(
         page = await context.new_page()
 
         for i, row in df.iterrows():
-            query = build_query(
-                safe_str(row.get(name_col)),
-                safe_str(row.get(address_col)),
-                fallback=safe_str(row.get("category")),
-            )
+            query = build_query(safe_str(row.get(name_col)), safe_str(row.get(address_col)), fallback=safe_str(row.get("category")))
             df.at[i, "youtube_query"] = query
 
             try:
@@ -372,7 +351,7 @@ async def add_youtube_shorts_to_df(
 
 
 # ============================================================
-# 4) TikTok => tiktok_video (JSON list)
+# 4) TikTok
 # ============================================================
 
 async def _dismiss_tiktok_popups(page) -> None:
@@ -416,14 +395,7 @@ async def _find_tiktok_videos_list(page, query: str, *, max_results: int = 5) ->
     return results
 
 
-async def add_tiktok_videos_to_df(
-    df: pd.DataFrame,
-    name_col: str,
-    address_col: str,
-    headless: bool = True,
-    tt_state_path: str = "tt_state.json",
-    max_results: int = 5,
-) -> pd.DataFrame:
+async def add_tiktok_videos_to_df(df: pd.DataFrame, name_col: str, address_col: str, headless: bool = True, tt_state_path: str = "tt_state.json", max_results: int = 5) -> pd.DataFrame:
     df = df.copy()
     df["tiktok_query"] = None
     df["tiktok_video"] = None
@@ -443,11 +415,7 @@ async def add_tiktok_videos_to_df(
         page = await context.new_page()
 
         for i, row in df.iterrows():
-            query = build_query(
-                safe_str(row.get(name_col)),
-                safe_str(row.get(address_col)),
-                fallback=safe_str(row.get("category")),
-            )
+            query = build_query(safe_str(row.get(name_col)), safe_str(row.get(address_col)), fallback=safe_str(row.get("category")))
             df.at[i, "tiktok_query"] = query
 
             try:
@@ -464,14 +432,10 @@ async def add_tiktok_videos_to_df(
 
 
 # ============================================================
-# 5) Instagram (Playwright best-effort + DDG fallback "loose")
+# 5) Instagram (Playwright best-effort + DDG html + DDG lite fallback)
 # ============================================================
 
-def _duckduckgo_html_search(query: str, timeout: int = 25) -> str:
-    """
-    DuckDuckGo /html/ (no JS).
-    """
-    url = "https://duckduckgo.com/html/?q=" + quote_plus(query)
+def _http_get(url: str, *, timeout: int = 25) -> str:
     req = Request(
         url,
         headers={
@@ -481,22 +445,27 @@ def _duckduckgo_html_search(query: str, timeout: int = 25) -> str:
             ),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
-            "Referer": "https://duckduckgo.com/",
         },
     )
     with urlopen(req, timeout=timeout) as resp:
         return resp.read().decode("utf-8", errors="ignore")
 
 
+def _duckduckgo_html_search(query: str, timeout: int = 25) -> str:
+    url = "https://duckduckgo.com/html/?q=" + quote_plus(query)
+    return _http_get(url, timeout=timeout)
+
+
+def _duckduckgo_lite_search(query: str, timeout: int = 25) -> str:
+    # Lite endpoint: souvent plus simple / moins filtré
+    url = "https://lite.duckduckgo.com/lite/?q=" + quote_plus(query)
+    return _http_get(url, timeout=timeout)
+
+
 def _extract_instagram_links_from_html(html: str, max_results: int = 5) -> list[str]:
-    """
-    Extract IG video links from HTML. Supports:
-      - DDG redirect links: uddg=<urlencoded>
-      - direct instagram.com/(reel|reels|p)/...
-    """
     links: list[str] = []
 
-    # (1) DDG redirect (uddg=...)
+    # (1) DDG redirect param uddg=
     for m in re.finditer(r"uddg=([^&\"'>\s]+)", html):
         try:
             decoded = unquote(m.group(1))
@@ -508,7 +477,7 @@ def _extract_instagram_links_from_html(html: str, max_results: int = 5) -> list[
         except Exception:
             continue
 
-    # (2) direct urls
+    # (2) Direct IG urls in HTML
     for m in re.finditer(INSTAGRAM_REEL_OR_POST_RE, html):
         u = normalize_instagram_url(m.group(0))
         if INSTAGRAM_ANY_VIDEO_RE.match(u) and u not in links:
@@ -519,53 +488,65 @@ def _extract_instagram_links_from_html(html: str, max_results: int = 5) -> list[
     return links
 
 
-def find_instagram_links_ddg_loose(place_name: str, city: str | None, max_results: int = 5) -> list[str]:
-    """
-    DDG fallback for IG:
-      - do NOT use full street address (too strict)
-      - use place name + (city if available), else without city
-    """
+def _build_ig_search_queries(place_name: str, city_or_region: str | None) -> list[str]:
     place_name = safe_str(place_name)
-    city = safe_str(city) or None
-    if not place_name:
-        return []
+    city_or_region = safe_str(city_or_region) or None
 
-    variants: list[str] = []
-    if city:
-        variants.extend([
-            f'site:instagram.com (reel OR reels OR p) "{place_name}" "{city}"',
-            f'site:instagram.com "{place_name}" "{city}" instagram',
-            f'{place_name} "{city}" site:instagram.com',
-            f'{place_name} instagram "{city}"',
+    queries: list[str] = []
+    if city_or_region:
+        queries.extend([
+            f'site:instagram.com (reel OR reels OR p) "{place_name}" "{city_or_region}"',
+            f'site:instagram.com "{place_name}" "{city_or_region}" instagram',
+            f'{place_name} "{city_or_region}" site:instagram.com',
+            f'{place_name} instagram "{city_or_region}"',
         ])
-    variants.extend([
+
+    # always include "no city" variants
+    queries.extend([
         f'site:instagram.com (reel OR reels OR p) "{place_name}"',
         f'site:instagram.com "{place_name}" instagram',
         f'{place_name} site:instagram.com',
     ])
+    return queries
 
-    last_q = None
-    last_html_sample = ""
 
-    for q in variants:
-        last_q = q
+def find_instagram_links_search(place_name: str, city_or_region: str | None, max_results: int = 5) -> list[str]:
+    """
+    Fallback search: try DDG html then DDG lite.
+    If both blocked/empty, logs html_len+sample to detect challenges.
+    """
+    place_name = safe_str(place_name)
+    if not place_name:
+        return []
+
+    queries = _build_ig_search_queries(place_name, city_or_region)
+
+    for q in queries:
+        # DDG html
         try:
             html = _duckduckgo_html_search(q)
-            last_html_sample = html[:800]
-        except Exception:
-            continue
+            links = _extract_instagram_links_from_html(html, max_results=max_results)
+            if links:
+                logging.info("[instagram][ddg-html] q=%r -> %s links", q, len(links))
+                return links
+            logging.info("[instagram][ddg-html] q=%r -> 0 links (html_len=%s)", q, len(html))
+        except Exception as e:
+            logging.info("[instagram][ddg-html] q=%r -> error=%s", q, e)
 
-        links = _extract_instagram_links_from_html(html, max_results=max_results)
-        if links:
-            return links
+        # DDG lite
+        try:
+            html = _duckduckgo_lite_search(q)
+            links = _extract_instagram_links_from_html(html, max_results=max_results)
+            if links:
+                logging.info("[instagram][ddg-lite] q=%r -> %s links", q, len(links))
+                return links
+            logging.info("[instagram][ddg-lite] q=%r -> 0 links (html_len=%s)", q, len(html))
+            # log small sample once (useful to see "captcha"/"too many requests")
+            sample = re.sub(r"\s+", " ", html[:250])
+            logging.info("[instagram][ddg-lite-sample] %r", sample)
+        except Exception as e:
+            logging.info("[instagram][ddg-lite] q=%r -> error=%s", q, e)
 
-    if last_q is not None:
-        logging.info(
-            "[instagram][ddg-debug] no links. last_query=%r html_len=%s sample=%r",
-            last_q,
-            len(last_html_sample),
-            last_html_sample[:200],
-        )
     return []
 
 
@@ -594,7 +575,7 @@ async def _handle_instagram_popups_best_effort(page) -> None:
 
 async def _find_instagram_links_list(page, query: str, *, max_results: int = 5) -> list[str]:
     """
-    Best-effort IG UI scraping (often blocked without valid ig_state).
+    Best-effort Instagram UI scraping (usually blocked without ig_state).
     """
     await page.goto("https://www.instagram.com/", wait_until="domcontentloaded", timeout=60000)
     await page.wait_for_timeout(1500)
@@ -678,8 +659,7 @@ async def add_instagram_videos_to_df(
 
     Strategy:
       1) Try Playwright UI (may be blocked)
-      2) Fallback DDG loose: use PLACE NAME + (CITY if possible), NOT street address
-         - city is taken from df['city'] if exists, else extracted from full address, else df['region'], else None
+      2) Fallback search (DDG html + lite): place_name + city/region if possible
     """
     df = df.copy()
     df["instagram_query"] = None
@@ -718,29 +698,27 @@ async def add_instagram_videos_to_df(
                 logging.warning("[instagram] playwright failed query=%r err=%s", query_ui, e)
                 links = []
 
-            # 2) DDG loose
+            # 2) Search fallback
             if not links:
-                # priority: existing city column > extract from full address > region column > None
-                city = None
+                # pick best location string from data if available
+                city_or_region = None
                 if "city" in df.columns:
-                    city = safe_str(row.get("city")) or None
-                if not city:
-                    city = extract_city_from_address_fr(address)
-                if not city and "region" in df.columns:
-                    city = safe_str(row.get("region")) or None
+                    city_or_region = safe_str(row.get("city")) or None
+                if not city_or_region:
+                    city_or_region = extract_city_from_address_fr(address)
+                if not city_or_region and "region" in df.columns:
+                    city_or_region = safe_str(row.get("region")) or None
 
-                ddg_links = find_instagram_links_ddg_loose(place_name=place_name, city=city, max_results=max_results)
-                logging.info("[instagram] fallback DDG loose found=%s (place=%r city=%r)", len(ddg_links), place_name, city)
-                if ddg_links:
-                    logging.info("[instagram] fallback first=%s", ddg_links[0])
-                links = ddg_links
+                links = find_instagram_links_search(place_name=place_name, city_or_region=city_or_region, max_results=max_results)
+                logging.info("[instagram] fallback search found=%s (place=%r loc=%r)", len(links), place_name, city_or_region)
+                if links:
+                    logging.info("[instagram] fallback first=%s", links[0])
 
             df.at[i, "instagram_video"] = json.dumps(links, ensure_ascii=False) if links else None
 
         await context.close()
         await browser.close()
 
-    # df.head logs
     try:
         logging.info("🔎 [instagram][head]\n%s", df[["instagram_query", "instagram_video"]].head(10).to_string(index=False))
     except Exception:
@@ -776,11 +754,7 @@ async def run_pipeline(
     if do_geocode:
         df = add_lat_lng(df, address_col=address_col, cache_path=geocode_cache)
 
-    for c in [
-        "youtube_query", "youtube_video",
-        "tiktok_query", "tiktok_video",
-        "instagram_query", "instagram_video",
-    ]:
+    for c in ["youtube_query", "youtube_video", "tiktok_query", "tiktok_video", "instagram_query", "instagram_video"]:
         if c not in df.columns:
             df[c] = None
 
@@ -797,22 +771,17 @@ async def run_pipeline(
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Enrich Google excels with YouTube Shorts(list)->youtube_video + TikTok(list)->tiktok_video + Instagram(list)->instagram_video."
-    )
+    parser = argparse.ArgumentParser(description="Enrich Google excels with YouTube/TikTok/Instagram.")
     parser.add_argument("--root", default=".", help="Root folder containing subfolders with google*.xlsx")
     parser.add_argument("--name-col", required=True, help="Column name containing the place name")
     parser.add_argument("--address-col", required=True, help="Column name containing the address")
     parser.add_argument("--headless", action="store_true", help="Run browsers headless")
     parser.add_argument("--geocode", action="store_true", help="Also compute latitude/longitude (requires geopy)")
     parser.add_argument("--geocode-cache", default="geocode_cache.csv", help="CSV cache file for geocoding")
-
     parser.add_argument("--tt-state", default="tt_state.json", help="TikTok storage_state file")
     parser.add_argument("--ig-state", default="ig_state.json", help="Instagram storage_state file")
-
     parser.add_argument("--debug-limit-rows", type=int, default=None, help="Limit rows before enrichment")
     parser.add_argument("--out", default="enriched.csv", help="Output CSV path")
-
     parser.add_argument("--no-youtube", action="store_true", help="Disable YouTube enrichment")
     parser.add_argument("--no-tiktok", action="store_true", help="Disable TikTok enrichment")
     parser.add_argument("--no-instagram", action="store_true", help="Disable Instagram enrichment")
