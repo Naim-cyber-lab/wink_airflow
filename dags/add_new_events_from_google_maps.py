@@ -37,12 +37,11 @@ DAG_DOC = r"""
   - tiktok_video = JSON list (textfield)
 - Instagram:
   - instagram_query
-  - instagram_reel (first)
   - instagram_video = JSON list (preferred)
 
-Logs DB:
-- SKIP / INSERT / UPDATE / NOOP (aucun changement effectif)
-- affiche id, titre, adresse, colonnes modifiées, et stats médias
+Logs:
+- enrich: df.head() ciblé + stats non-empty
+- db: SKIP / INSERT / UPDATE / NOOP + colonnes modifiées + stats médias
 """
 
 POSTAL_RE = re.compile(r"\b(\d{5})\b")
@@ -106,7 +105,7 @@ def _json_preview_list(json_list_str: str | None, limit: int = 10) -> list[str]:
 
 
 # -------------------------
-# LOG HELPERS (new)
+# LOG HELPERS
 # -------------------------
 
 def _short(s: str | None, n: int = 80) -> str:
@@ -138,6 +137,12 @@ def _log_row(action: str, *, titre: str, adresse: str, event_id: int | None = No
     logging.info(base)
 
 
+def _count_non_empty(series: pd.Series | None) -> int:
+    if series is None:
+        return 0
+    return int(series.fillna("").astype(str).str.strip().ne("").sum())
+
+
 # -------------------------
 # BIO builder
 # -------------------------
@@ -152,7 +157,6 @@ def _build_bio(
     tiktok_query: str | None,
     tiktok_video_json: str | None,
     instagram_query: str | None,
-    instagram_reel: str | None,
     instagram_video_json: str | None,
 ) -> str:
     base = safe_str(old_bio)
@@ -192,8 +196,6 @@ def _build_bio(
                 lines.append(bullet)
 
     add_line("Instagram query", instagram_query)
-    add_line("Instagram Reel", instagram_reel)
-
     ig_list = _json_preview_list(instagram_video_json)
     if ig_list:
         add_line("Instagram (first)", ig_list[0])
@@ -287,12 +289,34 @@ def enrich_and_export_csv(**context):
         "tiktok_query",
         "tiktok_video",
         "instagram_query",
-        "instagram_reel",
         "instagram_video",
     ]
     for col in expected:
         if col not in df.columns:
             df[col] = None
+
+    # 🔎 DEBUG df.head (voir si instagram_video est vide)
+    cols_debug = [
+        "category",
+        "source_folder",
+        name_col,
+        address_col,
+        "instagram_query",
+        "instagram_video",
+        "tiktok_video",
+        "youtube_video",
+    ]
+    cols_debug = [c for c in cols_debug if c in df.columns]
+    logging.info("🔎 [enrich][head] cols=%s", cols_debug)
+    logging.info("🔎 [enrich][head]\n%s", df[cols_debug].head(10).to_string(index=False))
+
+    logging.info(
+        "📊 [enrich] non-empty counts: instagram_video=%s instagram_query=%s | tiktok_video=%s | youtube_video=%s",
+        _count_non_empty(df.get("instagram_video")),
+        _count_non_empty(df.get("instagram_query")),
+        _count_non_empty(df.get("tiktok_video")),
+        _count_non_empty(df.get("youtube_video")),
+    )
 
     df.to_csv(out_csv, index=False)
     logging.info("✅ [enrich] Exported: %s | rows=%s", out_csv, len(df))
@@ -344,6 +368,7 @@ def upsert_events_from_csv(**context):
     try:
         cols = _get_table_columns(cursor, "profil_event")
         logging.info("🧱 [db] profil_event columns detected: %s cols", len(cols))
+        logging.info("🧪 [db] has instagram_video column? %s", "instagram_video" in cols)
 
         for _, row in df.iterrows():
             titre = safe_str(row.get(name_col))
@@ -367,7 +392,6 @@ def upsert_events_from_csv(**context):
             tiktok_video = safe_str(row.get("tiktok_video")) or None
 
             instagram_query = safe_str(row.get("instagram_query")) or None
-            instagram_reel = safe_str(row.get("instagram_reel")) or None
             instagram_video = safe_str(row.get("instagram_video")) or None
 
             lat = row.get("latitude", None)
@@ -402,20 +426,17 @@ def upsert_events_from_csv(**context):
                     tiktok_query=tiktok_query,
                     tiktok_video_json=tiktok_video,
                     instagram_query=instagram_query,
-                    instagram_reel=instagram_reel,
                     instagram_video_json=instagram_video,
                 )
 
                 update_map: dict[str, object] = {}
 
-                # bio: update only if changed (avoid useless UPDATE)
                 if "bioEvent" in cols and new_bio and new_bio != (old_bio or ""):
                     update_map["bioEvent"] = new_bio
 
                 if "website" in cols and (old_website is None and website is not None):
                     update_map["website"] = website
 
-                # geo: set only if NULL before
                 if "lat" in cols and old_lat is None and lat is not None:
                     update_map["lat"] = float(lat)
                 if "lon" in cols and old_lon is None and lon is not None:
@@ -440,8 +461,6 @@ def upsert_events_from_csv(**context):
 
                 if "instagram_query" in cols and instagram_query:
                     update_map["instagram_query"] = instagram_query
-                if "instagram_reel" in cols and instagram_reel:
-                    update_map["instagram_reel"] = instagram_reel
                 if "instagram_video" in cols and instagram_video:
                     update_map["instagram_video"] = instagram_video
 
@@ -480,7 +499,6 @@ def upsert_events_from_csv(**context):
                 tiktok_query=tiktok_query,
                 tiktok_video_json=tiktok_video,
                 instagram_query=instagram_query,
-                instagram_reel=instagram_reel,
                 instagram_video_json=instagram_video,
             )
 
@@ -536,8 +554,6 @@ def upsert_events_from_csv(**context):
 
             if "instagram_query" in cols:
                 insert_map["instagram_query"] = instagram_query
-            if "instagram_reel" in cols:
-                insert_map["instagram_reel"] = instagram_reel
             if "instagram_video" in cols:
                 insert_map["instagram_video"] = instagram_video
 
@@ -622,7 +638,6 @@ with DAG(
             "region_default": "Paris",
             "creator_winker_id": 116,
             "active_default": 0,
-            "maxNumberParticipant": 99999999,
             "max_participants": 99999999,
             "access_comment": True,
             "validated_from_web": False,
