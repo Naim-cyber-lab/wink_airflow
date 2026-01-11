@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import logging
 import os
 import time
@@ -8,13 +6,12 @@ from datetime import timedelta
 from zoneinfo import ZoneInfo
 
 import psycopg2
-import requests
 from airflow import DAG
 from airflow.hooks.base import BaseHook
-from airflow.models.param import Param
 from airflow.operators.python import PythonOperator
 from airflow.utils.dates import days_ago
 
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
 PARIS_TZ = ZoneInfo("Europe/Paris")
 DB_CONN_ID = "my_postgres"
@@ -24,79 +21,95 @@ def safe_str(x) -> str:
     return ("" if x is None else str(x)).strip()
 
 
-def build_fallback_urls(*, titre: str, adresse: str, city: str) -> tuple[str, str]:
+def get_google_reviews_url_with_playwright(query: str) -> str | None:
     """
-    Fallback sans place_id (pas besoin d'API).
-    - urlGoogleMapsAvis : Google Search "avis sur ..."
-    - urlAjoutGoogleMapsAvis : Maps search (l'utilisateur pourra cliquer puis "Ajouter un avis")
+    Ouvre Google, fait une recherche et tente de cliquer sur "Avis".
+    Retourne l'URL résultante.
     """
-    query = " ".join([p for p in [titre, adresse, city] if p]).strip()
+    q = query.strip()
+    if not q:
+        return None
 
-    # Ressemble à ton exemple "avis sur le 3bis"
-    search_q = f"avis sur {titre}"
-    if city:
-        search_q += f" {city}"
-    if adresse:
-        search_q += f" {adresse}"
+    search_url = "https://www.google.com/search?q=" + urllib.parse.quote_plus(q)
 
-    url_avis = "https://www.google.com/search?q=" + urllib.parse.quote_plus(search_q)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            locale="fr-FR",
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1365, "height": 768},
+        )
+        page = context.new_page()
 
-    # Ouverture Google Maps sur une recherche du lieu (user clique puis voit onglet Avis)
-    url_maps = "https://www.google.com/maps/search/?api=1&query=" + urllib.parse.quote_plus(query)
+        try:
+            page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
 
-    return url_avis, url_maps
+            # Consentement cookies (selon régions)
+            for selector in [
+                'button:has-text("Tout accepter")',
+                'button:has-text("Accepter tout")',
+                'button:has-text("J’accepte")',
+                'button:has-text("Accepter")',
+                'text="J’accepte"',
+            ]:
+                try:
+                    page.locator(selector).first.click(timeout=1500)
+                    break
+                except Exception:
+                    pass
+
+            # Attendre que la page soit vraiment chargée
+            page.wait_for_timeout(1500)
+
+            # En FR, le bouton/onglet peut être "Avis" ou "Avis Google"
+            # On tente plusieurs patterns, en visant le knowledge panel / résultats locaux.
+            candidates = [
+                'a:has-text("Avis")',
+                'span:has-text("Avis")',
+                'a:has-text("Avis Google")',
+                'span:has-text("Avis Google")',
+                'a[aria-label*="Avis"]',
+                'a[aria-label*="avis"]',
+            ]
+
+            clicked = False
+            for sel in candidates:
+                loc = page.locator(sel)
+                try:
+                    if loc.count() > 0:
+                        # On clique le premier visible
+                        loc.first.scroll_into_view_if_needed(timeout=2000)
+                        loc.first.click(timeout=4000)
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+
+            if not clicked:
+                return None
+
+            # Laisse le temps de navigation / changement d’URL
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=10000)
+            except PWTimeoutError:
+                pass
+
+            page.wait_for_timeout(500)
+            final_url = page.url
+
+            # IMPORTANT : cette URL peut être "longue" et variable.
+            # Si tu veux quand même quelque chose de plus stable, tu peux nettoyer.
+            return final_url
+
+        finally:
+            context.close()
+            browser.close()
 
 
-def fetch_place_id_from_text(query: str, api_key: str, session: requests.Session) -> str | None:
-    """
-    Google Places API - Find Place From Text
-    https://developers.google.com/maps/documentation/places/web-service/search-find-place
-    """
-    endpoint = "https://maps.googleapis.com/maps/api/place/findplacefromtext/json"
-    params = {
-        "input": query,
-        "inputtype": "textquery",
-        "fields": "place_id",
-        "key": api_key,
-    }
-    try:
-        r = session.get(endpoint, params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        candidates = data.get("candidates") or []
-        if candidates and isinstance(candidates, list):
-            place_id = candidates[0].get("place_id")
-            return safe_str(place_id) or None
-    except Exception as e:
-        logging.warning("Places API error for query=%r: %s", query, e)
-    return None
-
-
-def build_placeid_urls(place_id: str) -> tuple[str, str]:
-    """
-    Liens stables basés sur place_id
-    - Page du lieu (avec avis accessibles)
-    - Lien direct "ajouter un avis"
-    """
-    # Page Google Maps du lieu
-    url_place = "https://www.google.com/maps/place/?q=place_id:" + urllib.parse.quote_plus(place_id)
-
-    # Lien direct "Write a review"
-    url_write = "https://search.google.com/local/writereview?placeid=" + urllib.parse.quote_plus(place_id)
-
-    return url_place, url_write
-
-
-def update_google_reviews_urls(**context):
-    params = context["params"]
-
-    batch_size = int(params.get("batch_size", 500))
-    sleep_s = float(params.get("sleep_s", 0.0))
-    only_active = params.get("only_active", None)
-
-    api_key = os.getenv("GOOGLE_PLACES_API_KEY", "").strip()
-    use_places = bool(api_key)
-
+def update_events_reviews_url(**context):
     conn = BaseHook.get_connection(DB_CONN_ID)
     connection = psycopg2.connect(
         host=conn.host,
@@ -107,70 +120,48 @@ def update_google_reviews_urls(**context):
     )
     cursor = connection.cursor()
 
-    session = requests.Session()
-
     updated = 0
     skipped = 0
-    processed = 0
 
     try:
-        where = []
-        args = []
-
-        # ✅ uniquement si urlGoogleMapsAvis est vide
-        where.append('(COALESCE("urlGoogleMapsAvis", \'\') = \'\')')
-
-        if only_active is not None:
-            where.append('"active" = %s')
-            args.append(int(only_active))
-
-        where_sql = "WHERE " + " AND ".join(where)
-
+        # ✅ On ne prend que ceux dont urlGoogleMapsAvis est vide
         cursor.execute(
-            f"""
+            """
             SELECT id, titre, adresse, city
             FROM profil_event
-            {where_sql}
+            WHERE COALESCE("urlGoogleMapsAvis",'') = ''
             ORDER BY id ASC
-            """,
-            tuple(args),
+            """
         )
-
         rows = cursor.fetchall()
-        logging.info("Found %s events to process (use_places=%s)", len(rows), use_places)
+        logging.info("Events à enrichir (urlGoogleMapsAvis vide) : %s", len(rows))
 
-        for (event_id, titre, adresse, city) in rows:
-            processed += 1
-
+        for event_id, titre, adresse, city in rows:
             titre_s = safe_str(titre)
-            adresse_s = safe_str(adresse)
-            city_s = safe_str(city)
-
             if not titre_s:
                 skipped += 1
                 continue
 
-            query = " ".join([p for p in [titre_s, adresse_s, city_s] if p]).strip()
+            query = " ".join([p for p in [titre_s, safe_str(adresse), safe_str(city)] if p]).strip()
 
-            if use_places and query:
-                place_id = fetch_place_id_from_text(query=query, api_key=api_key, session=session)
-                if place_id:
-                    url_avis, url_write = build_placeid_urls(place_id)
-                else:
-                    url_avis, url_write = build_fallback_urls(titre=titre_s, adresse=adresse_s, city=city_s)
-            else:
-                url_avis, url_write = build_fallback_urls(titre=titre_s, adresse=adresse_s, city=city_s)
+            # C’est mieux d’orienter la recherche directement vers "Avis"
+            query_for_reviews = f"{query} Avis"
 
-            # ✅ sécurité: update seulement si toujours vide au moment de l'update
+            url = get_google_reviews_url_with_playwright(query_for_reviews)
+
+            if not url:
+                skipped += 1
+                continue
+
+            # ✅ sécurité: update seulement si toujours vide au moment de l’update
             cursor.execute(
                 """
                 UPDATE profil_event
-                SET "urlGoogleMapsAvis" = %s,
-                    "urlAjoutGoogleMapsAvis" = %s
+                SET "urlGoogleMapsAvis" = %s
                 WHERE id = %s
-                  AND COALESCE("urlGoogleMapsAvis", '') = ''
+                  AND COALESCE("urlGoogleMapsAvis",'') = ''
                 """,
-                (url_avis, url_write, int(event_id)),
+                (url, int(event_id)),
             )
 
             if cursor.rowcount == 1:
@@ -178,19 +169,18 @@ def update_google_reviews_urls(**context):
             else:
                 skipped += 1
 
-            if sleep_s > 0:
-                time.sleep(sleep_s)
-
-            if updated % batch_size == 0 and updated > 0:
+            if updated % 50 == 0:
                 connection.commit()
-                logging.info("Committed batch: updated=%s processed=%s skipped=%s", updated, processed, skipped)
+                logging.info("Commit: updated=%s skipped=%s", updated, skipped)
+
+            # éviter de se faire throttler (Google n’aime pas les rafales)
+            time.sleep(1.0)
 
         connection.commit()
-        logging.info("DONE: updated=%s processed=%s skipped=%s", updated, processed, skipped)
+        logging.info("DONE updated=%s skipped=%s", updated, skipped)
 
-    except Exception as e:
+    except Exception:
         connection.rollback()
-        logging.error("Failure: %s", e)
         raise
     finally:
         cursor.close()
@@ -200,27 +190,17 @@ def update_google_reviews_urls(**context):
 default_args = {"owner": "airflow", "retries": 1, "retry_delay": timedelta(minutes=2)}
 
 with DAG(
-    dag_id="enrich_events_google_reviews_urls",
+    dag_id="enrich_events_google_reviews_url_playwright",
     start_date=days_ago(1),
-    schedule_interval="15 3 * * *",
+    schedule_interval="30 3 * * *",
     catchup=False,
     default_args=default_args,
-    tags=["event", "google", "reviews", "maps"],
-    params={
-        # force=True => réécrit tous les liens même si déjà remplis
-        "force": Param(False, type="boolean"),
-        # commit tous les N updates
-        "batch_size": Param(500, type="integer"),
-        # utile si GOOGLE_PLACES_API_KEY et tu veux éviter rate-limit
-        "sleep_s": Param(0.0, type="number"),
-        # None => tous, sinon filtre sur active (0/1/2...)
-        "only_active": Param(None, type=["integer", "null"]),
-    },
+    tags=["event", "google", "reviews", "playwright"],
 ) as dag:
     dag.timezone = PARIS_TZ
 
-    t1 = PythonOperator(
-        task_id="update_google_reviews_urls",
-        python_callable=update_google_reviews_urls,
+    PythonOperator(
+        task_id="update_urlGoogleMapsAvis_if_empty",
+        python_callable=update_events_reviews_url,
         provide_context=True,
     )
