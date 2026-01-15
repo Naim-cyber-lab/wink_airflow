@@ -25,27 +25,25 @@ PARIS_LAT = 48.8566
 PARIS_LON = 2.3522
 PARIS_RADIUS_KM = 35.0
 
+# Fenêtre "nouveaux inscrits"
+NEW_USERS_MAX_AGE_DAYS = 7
+
 # Texte du message de bienvenue (modifiable via Variables Airflow)
 WELCOME_MESSAGE_TEXT = Variable.get(
     "BROADCAST_MESSAGE_116",
     default_var=(
-        """
-        👋 Bienvenue sur Nisu,
-        Ici, on se retrouve pour partager des sorties, des rires et de belles rencontres 🌟,
-        Notre mot d’ordre : bienveillance, respect et bonne humeur 💬💛,
-        Si tu as la moindre question, tu peux nous écrire directement ici.
-        On est ravis de t’accueillir dans la communauté et à très vite pour ta première sortie ! 🚀✨
-        """
+        "👋 Bienvenue sur Nisu !\n\n"
+        "On est ravis de t’accueillir 😊\n"
+        "À très vite !"
     ),
 )
 
+# Version courte (pour le bundle Paris si tu veux différencier)
 WELCOME_MESSAGE_TEXT_SHORT = Variable.get(
-    "BROADCAST_MESSAGE_116",
+    "BROADCAST_MESSAGE_116_SHORT",
     default_var=(
-        """
-        👋 Bienvenue sur Nisu,
-        Ici, on se retrouve pour partager des sorties, des rires et de belles rencontres 🌟,
-        """
+        "👋 Bienvenue sur Nisu !\n"
+        "Ravi de t’accueillir 😊"
     ),
 )
 
@@ -110,14 +108,6 @@ def _send_expo(tokens, title, body, data=None):
         try:
             r = requests.post(EXPO_API, json=chunk, headers=headers, timeout=15)
             r.raise_for_status()
-            res = r.json()
-            try:
-                data_items = res.get("data") or []
-                errors = [d for d in data_items if isinstance(d, dict) and d.get("status") != "ok"]
-                if errors:
-                    logging.warning("Expo push errors: %s", errors)
-            except Exception:
-                pass
             sent += len(chunk)
         except Exception as e:
             logging.exception("Expo push failed on chunk: %s", e)
@@ -125,10 +115,7 @@ def _send_expo(tokens, title, body, data=None):
 
 
 def _haversine_km(lat1, lon1, lat2, lon2) -> float:
-    """
-    Distance grand cercle en km.
-    """
-    # Rayon moyen Terre en km
+    """Distance grand cercle en km."""
     R = 6371.0088
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
@@ -151,21 +138,17 @@ def _get_optional_conversation_activity_ids(kwargs):
     ca1 = params.get("conversation_activity_id_1", conf.get("conversation_activity_id_1"))
     ca2 = params.get("conversation_activity_id_2", conf.get("conversation_activity_id_2"))
 
-    # Les champs sont optionnels globalement : on cast seulement si présents.
     ca1 = int(ca1) if ca1 not in (None, "", 0, "0") else None
     ca2 = int(ca2) if ca2 not in (None, "", 0, "0") else None
     return ca1, ca2
 
 
 def _assert_conversation_activities_exist(cur, ca1: int, ca2: int):
-    """
-    Sécurise : évite d’insérer un FK conversation_id qui n’existe pas.
-    """
     ids = [x for x in (ca1, ca2) if x is not None]
     if not ids:
         return
 
-    # Table très probablement "profil_conversationactivity" (à adapter si ton nom réel diffère)
+    # ⚠️ Assumption: table name = profil_conversationactivity (comme ton DAG)
     cur.execute(
         """
         SELECT id
@@ -237,10 +220,6 @@ def _insert_text_message(cur, chat_id: int, target_id: int, text: str) -> int:
 
 
 def _insert_conversation_activity_message(cur, chat_id: int, target_id: int, conversation_activity_id: int) -> int:
-    """
-    Message qui “pointe” vers une ConversationActivity (FK conversation_id).
-    On laisse message NULL (ou tu peux mettre un petit texte si tu veux).
-    """
     cur.execute(
         """
         INSERT INTO profil_chatwinkermessagesclass
@@ -280,51 +259,65 @@ def _update_chat_last_and_unseen(cur, chat_id: int, target_id: int, last_msg_id:
         (last_msg_id, target_id, inc, target_id, inc, chat_id),
     )
 
-
 # ========= TASKS =========
 
 
 def get_targets(**kwargs):
+    """
+    Cibles = users:
+      - inscrits depuis moins de 7 jours (date_joined >= NOW() - interval '7 days')
+      - différents de 116
+      - et à qui 116 n’a JAMAIS envoyé de message
+      - et pas de chat déjà existant entre 116 et eux (double sécurité)
+    """
     ti = kwargs["ti"]
     with _pg_connect() as connection, connection.cursor() as cur:
         cur.execute(
             """
-            SELECT id
-            FROM profil_winker
-            WHERE id NOT IN (
-                SELECT DISTINCT
-                    CASE
-                        WHEN winker1_id = %s THEN winker2_id
-                        ELSE winker1_id
-                    END AS other_winker_id
-                FROM profil_chatwinker
-                WHERE %s IN (winker1_id, winker2_id)
-                  AND winker1_id <> winker2_id
-            )
-              AND id <> %s
+            SELECT w.id
+            FROM profil_winker w
+            WHERE w.id <> %s
+              AND w.date_joined >= NOW() - (%s || ' days')::interval
+
+              -- Pas de conversation existante entre 116 et l'user (en pratique => jamais contacté)
+              AND NOT EXISTS (
+                SELECT 1
+                FROM profil_chatwinker cw
+                WHERE %s IN (cw.winker1_id, cw.winker2_id)
+                  AND w.id IN (cw.winker1_id, cw.winker2_id)
+                  AND cw.winker1_id <> cw.winker2_id
+              )
+
+              -- Double sécurité : aucun message déjà envoyé par 116 vers lui
+              AND NOT EXISTS (
+                SELECT 1
+                FROM profil_chatwinkermessagesclass m
+                WHERE m.winker_id = %s
+                  AND m.winker2_id = w.id
+                  AND m.is_removed = FALSE
+              )
             """,
-            (SENDER_ID, SENDER_ID, SENDER_ID),
+            (SENDER_ID, NEW_USERS_MAX_AGE_DAYS, SENDER_ID, SENDER_ID),
         )
         targets = [row[0] for row in cur.fetchall()]
 
-    logging.info("🎯 %s cibles trouvées (à contacter depuis %s).", len(targets), SENDER_ID)
+    logging.info(
+        "🎯 %s cibles trouvées (date_joined < %s jours, jamais contactées par %s).",
+        len(targets),
+        NEW_USERS_MAX_AGE_DAYS,
+        SENDER_ID,
+    )
     ti.xcom_push(key="targets", value=targets)
 
 
 def send_messages_and_collect_tokens(**kwargs):
     """
-    Règle demandée :
-      - Si user est à > 35 km de Paris (lat/lon), on envoie UNIQUEMENT le message de bienvenue.
-      - Sinon (<= 35 km), on envoie :
-            1) Bienvenue
-            2) Un message qui précise qu'on a 2 events partenaires (bars à jeux à Paris)
-            3) 2 messages liés à 2 ConversationActivity (inputs)
-
-    Notes :
-      - conversation_activity_id_1 / _2 sont optionnels globalement,
-        MAIS nécessaires pour le chemin "Paris" (<= 35km).
-      - On récupère latitude/longitude depuis profil_winker.
-        (Si tes champs ne s’appellent pas latitude/longitude, dis-moi leurs noms et je te le ajuste.)
+    Règle Paris:
+      - > 35 km de Paris => envoie UNIQUEMENT WELCOME_MESSAGE_TEXT
+      - <= 35 km => envoie :
+            1) WELCOME_MESSAGE_TEXT_SHORT
+            2) PARIS_RECO_INTRO_TEXT
+            3) 2 messages ConversationActivity (inputs)
     """
     ti = kwargs["ti"]
     targets = ti.xcom_pull(task_ids="get_targets", key="targets") or []
@@ -344,13 +337,13 @@ def send_messages_and_collect_tokens(**kwargs):
         connection.autocommit = False
         try:
             with connection.cursor() as cur:
-                # Si on doit envoyer les ConversationActivity, on valide qu’elles existent (fail fast)
-                # MAIS uniquement si elles sont fournies — la validation stricte “obligatoire” se fait plus bas
+                # On ne valide les CA que si on a besoin du chemin Paris
+                # (Validation stricte plus bas si user <= 35km)
                 if ca1 is not None or ca2 is not None:
                     _assert_conversation_activities_exist(cur, ca1, ca2)
 
                 for target_id in targets:
-                    # Fetch user location
+                    # ⚠️ Assumption: colonnes = lat/lon (comme ton DAG)
                     cur.execute(
                         """
                         SELECT lat, lon, "expoPushToken"
@@ -366,25 +359,27 @@ def send_messages_and_collect_tokens(**kwargs):
 
                     lat, lon, expo_token = row[0], row[1], row[2]
 
-                    # Si pas de lat/lon, on considère "hors Paris" => welcome only (safe)
                     is_within_paris = False
                     if lat is not None and lon is not None:
                         try:
                             dist_km = _haversine_km(float(lat), float(lon), PARIS_LAT, PARIS_LON)
                             is_within_paris = dist_km <= PARIS_RADIUS_KM
                         except Exception:
-                            logging.exception("Erreur calcul distance pour user %s (lat=%s lon=%s).", target_id, lat, lon)
+                            logging.exception(
+                                "Erreur calcul distance pour user %s (lat=%s lon=%s).",
+                                target_id,
+                                lat,
+                                lon,
+                            )
                             is_within_paris = False
 
                     chat_id = _upsert_chat(cur, target_id)
 
                     if not is_within_paris:
-                        # >35km (ou pas de géoloc) => seulement welcome
                         last_id = _insert_text_message(cur, chat_id, target_id, WELCOME_MESSAGE_TEXT)
                         _update_chat_last_and_unseen(cur, chat_id, target_id, last_msg_id=last_id, inc=1)
                         sent_welcome_only += 1
                     else:
-                        # <=35km => bundle Paris (welcome + intro + 2 ConversationActivity)
                         if ca1 is None or ca2 is None:
                             raise ValueError(
                                 "User within 35km of Paris requires both inputs: "
@@ -396,7 +391,6 @@ def send_messages_and_collect_tokens(**kwargs):
                         id3 = _insert_conversation_activity_message(cur, chat_id, target_id, ca1)
                         id4 = _insert_conversation_activity_message(cur, chat_id, target_id, ca2)
 
-                        # lastMessage = dernier message (2e conversation activity)
                         _update_chat_last_and_unseen(cur, chat_id, target_id, last_msg_id=id4, inc=4)
                         sent_paris_bundle += 1
 
@@ -434,23 +428,22 @@ def push_notifications(**kwargs):
     sent = _send_expo(tokens, title, body, data=payload)
     logging.info("📲 Push envoyé à %s utilisateurs.", sent)
 
-
 # ========= DAG =========
 
 with DAG(
     dag_id="broadcast_from_116",
     description=(
-        "Envoie un welcome à toutes les cibles. "
-        "Si la cible est à <=35km de Paris, envoie aussi une reco + 2 ConversationActivity."
+        "Cible uniquement les users inscrits depuis < 7 jours et jamais contactés par 116. "
+        "Envoie welcome; si <=35km Paris, envoie aussi 2 ConversationActivity."
     ),
     default_args=default_args,
-    schedule_interval=None,  # déclenchement manuel
+    schedule_interval=None,
     start_date=days_ago(1),
     catchup=False,
     max_active_runs=1,
     tags=["chat", "broadcast", "expo", "116"],
     params={
-        # Optionnels globalement; requis uniquement pour les users <=35km Paris
+        # requis uniquement pour les users <=35km Paris
         "conversation_activity_id_1": Param(
             None, type=["null", "integer"], description="ConversationActivity id #1 (Paris bundle)"
         ),
