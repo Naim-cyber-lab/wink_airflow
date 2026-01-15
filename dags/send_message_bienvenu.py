@@ -353,7 +353,7 @@ def send_messages_and_collect_tokens(**kwargs):
                     # Fetch user location
                     cur.execute(
                         """
-                        SELECT latitude, longitude, "expoPushToken"
+                        SELECT lat, lon, "expoPushToken"
                         FROM profil_winker
                         WHERE id = %s
                         """,
