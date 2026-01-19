@@ -9,10 +9,8 @@ from airflow.hooks.base import BaseHook
 from airflow.operators.python import PythonOperator
 from airflow.utils.dates import days_ago
 
-# ================== CONFIG ==================
-
 PARIS_TZ = ZoneInfo("Europe/Paris")
-DB_CONN_ID = "my_postgres"  # adapte au nom de ta connexion Postgres
+DB_CONN_ID = "my_postgres"   # adapte au nom de ta connexion Airflow
 RETENTION_DAYS = 5
 
 default_args = {
@@ -21,12 +19,7 @@ default_args = {
     "retry_delay": timedelta(minutes=2),
 }
 
-# ================== HELPERS ==================
-
 def _pg_connect():
-    """
-    Connexion PostgreSQL via la Connection Airflow `my_postgres`.
-    """
     conn = BaseHook.get_connection(DB_CONN_ID)
     return psycopg2.connect(
         host=conn.host,
@@ -36,17 +29,10 @@ def _pg_connect():
         password=conn.password,
     )
 
-# ================== CORE TASK ==================
-
 def purge_old_conversation_activities(**kwargs):
-    """
-    Supprime les ConversationActivity plus vieilles que RETENTION_DAYS.
-    - On supprime d'abord les dépendances connues (participants)
-      pour éviter les erreurs de FK si pas de cascade.
-    """
     with _pg_connect() as connection:
         with connection.cursor() as cur:
-            # 1) Récupère les ids à supprimer (utile pour logs + deletes liés)
+            # 1) IDs des conversations à purger
             cur.execute(
                 """
                 SELECT id
@@ -61,9 +47,20 @@ def purge_old_conversation_activities(**kwargs):
                 logging.info("✅ Aucun ConversationActivity à supprimer (>%s jours).", RETENTION_DAYS)
                 return
 
-            logging.info("🧹 %s ConversationActivity à supprimer (>%s jours).", len(ids), RETENTION_DAYS)
+            logging.info("🧹 %s ConversationActivity à purger (>%s jours).", len(ids), RETENTION_DAYS)
 
-            # 2) Supprime les participants liés (FK classique vers conversationActivity_id)
+            # 2) Feedback : on détache (conversation_id = NULL) au lieu de supprimer
+            cur.execute(
+                """
+                UPDATE profil_conversationactivityfeedback
+                SET conversation_id = NULL
+                WHERE conversation_id = ANY(%s)
+                """,
+                (ids,),
+            )
+            logging.info("📝 Feedback détachés (conversation_id=NULL): %s", cur.rowcount)
+
+            # 3) Participants
             cur.execute(
                 """
                 DELETE FROM profil_participantconversationactivity
@@ -73,7 +70,17 @@ def purge_old_conversation_activities(**kwargs):
             )
             logging.info("👥 Participants supprimés: %s", cur.rowcount)
 
-            # 3) Supprime les conversations
+            # 4) Messages
+            cur.execute(
+                """
+                DELETE FROM profil_conversationactivitymessages
+                WHERE "conversationActivity_id" = ANY(%s)
+                """,
+                (ids,),
+            )
+            logging.info("💬 Messages supprimés: %s", cur.rowcount)
+
+            # 5) Conversations
             cur.execute(
                 """
                 DELETE FROM profil_conversationactivity
@@ -86,20 +93,19 @@ def purge_old_conversation_activities(**kwargs):
             connection.commit()
             logging.info("✅ Purge terminée.")
 
-# ================== DAG ==================
-
 with DAG(
-    dag_id="purge_old_conversation_activities",
-    description="Supprime chaque jour les ConversationActivity dont la date est plus vieille que 5 jours.",
+    dag_id="deleted_expired_conversation_activity",
+    description="Purge quotidienne des ConversationActivity > 5 jours (messages/participants supprimés, feedback détaché).",
     default_args=default_args,
     schedule_interval="@daily",
+    start_date=days_ago(1),
     catchup=False,
     max_active_runs=1,
     tags=["conversation", "cleanup", "postgres"],
 ) as dag:
     dag.timezone = PARIS_TZ
 
-    purge_task = PythonOperator(
+    PythonOperator(
         task_id="purge_old_conversation_activities",
         python_callable=purge_old_conversation_activities,
         provide_context=True,
