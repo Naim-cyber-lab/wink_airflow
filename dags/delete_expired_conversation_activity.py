@@ -32,7 +32,7 @@ def _pg_connect():
 def purge_old_conversation_activities(**kwargs):
     with _pg_connect() as connection:
         with connection.cursor() as cur:
-            # 1) IDs des conversations à purger
+            # 1) Conversations à purger
             cur.execute(
                 """
                 SELECT id
@@ -41,52 +41,77 @@ def purge_old_conversation_activities(**kwargs):
                 """,
                 (f"{RETENTION_DAYS} days",),
             )
-            ids = [r[0] for r in cur.fetchall()]
+            conv_ids = [r[0] for r in cur.fetchall()]
 
-            if not ids:
-                logging.info("✅ Aucun ConversationActivity à supprimer (>%s jours).", RETENTION_DAYS)
+            if not conv_ids:
+                logging.info("✅ Aucun ConversationActivity à purger (>%s jours).", RETENTION_DAYS)
                 return
 
-            logging.info("🧹 %s ConversationActivity à purger (>%s jours).", len(ids), RETENTION_DAYS)
+            logging.info("🧹 %s ConversationActivity à purger (>%s jours).", len(conv_ids), RETENTION_DAYS)
 
-            # 2) Feedback : on détache (conversation_id = NULL) au lieu de supprimer
+            # 2) Feedback : on détache (conversation_id = NULL)
             cur.execute(
                 """
                 UPDATE profil_conversationactivityfeedback
                 SET conversation_id = NULL
                 WHERE conversation_id = ANY(%s)
                 """,
-                (ids,),
+                (conv_ids,),
             )
-            logging.info("📝 Feedback détachés (conversation_id=NULL): %s", cur.rowcount)
+            logging.info("📝 Feedback détachés: %s", cur.rowcount)
 
-            # 3) Participants
+            # 3) Messages liés aux conversations
+            cur.execute(
+                """
+                SELECT id
+                FROM profil_conversationactivitymessages
+                WHERE "conversationActivity_id" = ANY(%s)
+                """,
+                (conv_ids,),
+            )
+            msg_ids = [r[0] for r in cur.fetchall()]
+            logging.info("💬 Messages trouvés à supprimer: %s", len(msg_ids))
+
+            # 4) Réactions sur ces messages (si messages existent)
+            if msg_ids:
+                cur.execute(
+                    """
+                    DELETE FROM profil_conversationactivitymessagereaction
+                    WHERE message_id = ANY(%s)
+                    """,
+                    (msg_ids,),
+                )
+                logging.info("❤️ Réactions supprimées: %s", cur.rowcount)
+
+                # 5) Suppression des messages
+                cur.execute(
+                    """
+                    DELETE FROM profil_conversationactivitymessages
+                    WHERE id = ANY(%s)
+                    """,
+                    (msg_ids,),
+                )
+                logging.info("💬 Messages supprimés: %s", cur.rowcount)
+            else:
+                logging.info("ℹ️ Aucun message à supprimer pour ces conversations.")
+
+            # 6) Participants liés
             cur.execute(
                 """
                 DELETE FROM profil_participantconversationactivity
                 WHERE "conversationActivity_id" = ANY(%s)
                 """,
-                (ids,),
+                (conv_ids,),
             )
             logging.info("👥 Participants supprimés: %s", cur.rowcount)
 
-            # 4) Messages
-            cur.execute(
-                """
-                DELETE FROM profil_conversationactivitymessages
-                WHERE "conversationActivity_id" = ANY(%s)
-                """,
-                (ids,),
-            )
-            logging.info("💬 Messages supprimés: %s", cur.rowcount)
-
-            # 5) Conversations
+            # 7) Suppression des conversations
             cur.execute(
                 """
                 DELETE FROM profil_conversationactivity
                 WHERE id = ANY(%s)
                 """,
-                (ids,),
+                (conv_ids,),
             )
             logging.info("💥 Conversations supprimées: %s", cur.rowcount)
 
@@ -94,8 +119,8 @@ def purge_old_conversation_activities(**kwargs):
             logging.info("✅ Purge terminée.")
 
 with DAG(
-    dag_id="deleted_expired_conversation_activity",
-    description="Purge quotidienne des ConversationActivity > 5 jours (messages/participants supprimés, feedback détaché).",
+    dag_id="purge_old_conversation_activities",
+    description="Purge quotidienne des ConversationActivity > 5 jours (feedback detach, reactions/messages/participants deleted).",
     default_args=default_args,
     schedule_interval="@daily",
     start_date=days_ago(1),
