@@ -104,10 +104,7 @@ def send_conversation_activity_reminders(**kwargs):
     window_minutes = 10
 
     delays = [
-        (2, "2h"),
-        (10, "10h"),
         (24, "24h"),
-        (48, "48h"),
     ]
 
     with _pg_connect() as connection:
