@@ -188,6 +188,16 @@ def purge_old_conversation_activities(**kwargs):
             )
             logging.info("⚙️ profil_preference supprimés: %s", cur.rowcount)
 
+            # 6quinquies) ChatWinkerMessagesClass liés aux conversations (FK bloquante)
+            cur.execute(
+                """
+                DELETE FROM profil_chatwinkermessagesclass
+                WHERE conversation_id = ANY(%s)
+                """,
+                (conv_ids,),
+            )
+            logging.info("💬 profil_chatwinkermessagesclass supprimés: %s", cur.rowcount)
+
             # 7) Suppression des conversations
             cur.execute(
                 """
@@ -204,7 +214,7 @@ def purge_old_conversation_activities(**kwargs):
 
 with DAG(
     dag_id="purge_old_conversation_activities",
-    description="Purge quotidienne des ConversationActivity > 5 jours (feedback detach, polls/votes/options, reactions/messages/participants/seen/confirmParticipation/preferences deleted).",
+    description="Purge quotidienne des ConversationActivity > 5 jours (feedback detach, polls/votes/options, reactions/messages/participants/seen/confirmParticipation/preferences/chatWinkerMessages deleted).",
     default_args=default_args,
     schedule_interval="@daily",
     start_date=days_ago(1),
