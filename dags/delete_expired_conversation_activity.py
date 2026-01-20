@@ -172,7 +172,7 @@ def purge_old_conversation_activities(**kwargs):
             )
             logging.info("👥 Participants supprimés: %s", cur.rowcount)
 
-            # 6bis) Seen / last seen par conversation
+            # 6bis) Seen / last seen par conversation (⚠️ colonne camelCase => guillemets obligatoires)
             cur.execute(
                 """
                 DELETE FROM seen_winker_activity
@@ -181,6 +181,16 @@ def purge_old_conversation_activities(**kwargs):
                 (conv_ids,),
             )
             logging.info("👁️ seen_winker_activity supprimés: %s", cur.rowcount)
+
+            # 6ter) ConfirmParticipationModal liés aux conversations
+            cur.execute(
+                """
+                DELETE FROM profil_confirmparticipationmodal
+                WHERE conversation_activity_id = ANY(%s)
+                """,
+                (conv_ids,),
+            )
+            logging.info("✅ profil_confirmparticipationmodal supprimés: %s", cur.rowcount)
 
             # 7) Suppression des conversations
             cur.execute(
@@ -198,7 +208,7 @@ def purge_old_conversation_activities(**kwargs):
 
 with DAG(
     dag_id="purge_old_conversation_activities",
-    description="Purge quotidienne des ConversationActivity > 5 jours (feedback detach, polls/votes/options, reactions/messages/participants/seen deleted).",
+    description="Purge quotidienne des ConversationActivity > 5 jours (feedback detach, polls/votes/options, reactions/messages/participants/seen/confirmParticipation deleted).",
     default_args=default_args,
     schedule_interval="@daily",
     start_date=days_ago(1),
