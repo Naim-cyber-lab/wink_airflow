@@ -176,7 +176,7 @@ def purge_old_conversation_activities(**kwargs):
             cur.execute(
                 """
                 DELETE FROM seen_winker_activity
-                WHERE conversationActivity_id = ANY(%s)
+                WHERE "conversationActivity_id" = ANY(%s)
                 """,
                 (conv_ids,),
             )
