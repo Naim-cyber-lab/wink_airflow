@@ -75,9 +75,7 @@ def purge_old_conversation_activities(**kwargs):
             logging.info("💬 Messages trouvés à supprimer: %s", len(msg_ids))
 
             # 3bis) Suppression des sondages liés aux messages
-            # PollConversation -> PollOptionConversation -> VoteConversation
             if msg_ids:
-                # PollConversation ids
                 cur.execute(
                     """
                     SELECT id
@@ -90,7 +88,6 @@ def purge_old_conversation_activities(**kwargs):
                 logging.info("📊 PollConversation trouvés: %s", len(poll_ids))
 
                 if poll_ids:
-                    # PollOptionConversation ids
                     cur.execute(
                         """
                         SELECT id
@@ -102,7 +99,6 @@ def purge_old_conversation_activities(**kwargs):
                     option_ids = [r[0] for r in cur.fetchall()]
                     logging.info("🧩 PollOptionConversation trouvées: %s", len(option_ids))
 
-                    # VoteConversation (enfant des options)
                     if option_ids:
                         cur.execute(
                             """
@@ -113,7 +109,6 @@ def purge_old_conversation_activities(**kwargs):
                         )
                         logging.info("🗳️ VoteConversation supprimés: %s", cur.rowcount)
 
-                        # Options
                         cur.execute(
                             """
                             DELETE FROM profil_polloptionconversation
@@ -122,10 +117,7 @@ def purge_old_conversation_activities(**kwargs):
                             (option_ids,),
                         )
                         logging.info("🧩 PollOptionConversation supprimées: %s", cur.rowcount)
-                    else:
-                        logging.info("ℹ️ Aucune PollOptionConversation à supprimer.")
 
-                    # Polls
                     cur.execute(
                         """
                         DELETE FROM profil_pollconversation
@@ -134,10 +126,6 @@ def purge_old_conversation_activities(**kwargs):
                         (poll_ids,),
                     )
                     logging.info("📊 PollConversation supprimés: %s", cur.rowcount)
-                else:
-                    logging.info("ℹ️ Aucun PollConversation lié à ces messages.")
-            else:
-                logging.info("ℹ️ Aucun message => aucun sondage à supprimer.")
 
             # 4) Réactions sur ces messages
             if msg_ids:
@@ -159,8 +147,6 @@ def purge_old_conversation_activities(**kwargs):
                     (msg_ids,),
                 )
                 logging.info("💬 Messages supprimés: %s", cur.rowcount)
-            else:
-                logging.info("ℹ️ Aucun message à supprimer pour ces conversations.")
 
             # 6) Participants liés
             cur.execute(
@@ -172,7 +158,7 @@ def purge_old_conversation_activities(**kwargs):
             )
             logging.info("👥 Participants supprimés: %s", cur.rowcount)
 
-            # 6bis) Seen / last seen par conversation (⚠️ colonne camelCase => guillemets obligatoires)
+            # 6bis) Seen / last seen (⚠️ colonne camelCase => guillemets)
             cur.execute(
                 """
                 DELETE FROM seen_winker_activity
@@ -182,7 +168,7 @@ def purge_old_conversation_activities(**kwargs):
             )
             logging.info("👁️ seen_winker_activity supprimés: %s", cur.rowcount)
 
-            # 6ter) ConfirmParticipationModal liés aux conversations
+            # 6ter) ConfirmParticipationModal
             cur.execute(
                 """
                 DELETE FROM profil_confirmparticipationmodal
@@ -191,6 +177,16 @@ def purge_old_conversation_activities(**kwargs):
                 (conv_ids,),
             )
             logging.info("✅ profil_confirmparticipationmodal supprimés: %s", cur.rowcount)
+
+            # 6quater) Preferences liés aux conversations
+            cur.execute(
+                """
+                DELETE FROM profil_preference
+                WHERE conversation_id = ANY(%s)
+                """,
+                (conv_ids,),
+            )
+            logging.info("⚙️ profil_preference supprimés: %s", cur.rowcount)
 
             # 7) Suppression des conversations
             cur.execute(
@@ -208,7 +204,7 @@ def purge_old_conversation_activities(**kwargs):
 
 with DAG(
     dag_id="purge_old_conversation_activities",
-    description="Purge quotidienne des ConversationActivity > 5 jours (feedback detach, polls/votes/options, reactions/messages/participants/seen/confirmParticipation deleted).",
+    description="Purge quotidienne des ConversationActivity > 5 jours (feedback detach, polls/votes/options, reactions/messages/participants/seen/confirmParticipation/preferences deleted).",
     default_args=default_args,
     schedule_interval="@daily",
     start_date=days_ago(1),
