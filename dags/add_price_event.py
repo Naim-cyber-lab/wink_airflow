@@ -214,10 +214,8 @@ def normalize_price(best: Optional[Dict[str, Any]]) -> Optional[str]:
 # ================== DB QUERIES ==================
 def fetch_events_missing_price(limit: int = 500):
     """
-    On vise les events sans info prix:
-      - priceevent NULL/'' ET price NULL/''
-    On prend les champs texte pour extraction + prixinitial pour éventuellement le remplir.
-    IMPORTANT: colonnes Postgres en snake_case (bioevent_fr, bioevent, priceevent, prixinitial).
+    Events sans info prix:
+      - "priceEvent" NULL/'' ET price NULL/''
     """
     sql = """
         SELECT
@@ -256,15 +254,16 @@ def update_event_price(
 ) -> None:
     """
     Met à jour:
-      - priceevent (raw trouvé)
+      - "priceEvent" (raw trouvé)
       - price (normalisé)
-      - prixinitial uniquement si valeur fournie (et qu'on veut l'écrire)
+      - "prixInitial" uniquement si valeur fournie
+    IMPORTANT: colonnes CamelCase entre guillemets.
     """
     if prix_initial_value is None:
-        sql = "UPDATE profil_event SET priceevent = %s, price = %s WHERE id = %s"
+        sql = 'UPDATE profil_event SET "priceEvent" = %s, price = %s WHERE id = %s'
         params = (price_event_raw, price_norm, event_id)
     else:
-        sql = "UPDATE profil_event SET priceevent = %s, price = %s, prixinitial = %s WHERE id = %s"
+        sql = 'UPDATE profil_event SET "priceEvent" = %s, price = %s, "prixInitial" = %s WHERE id = %s'
         params = (price_event_raw, price_norm, float(prix_initial_value), event_id)
 
     conn = _pg_connect()
@@ -274,7 +273,6 @@ def update_event_price(
         conn.commit()
     finally:
         conn.close()
-
 
 # ================== AIRFLOW TASK ==================
 def add_price_to_event(**_context):
