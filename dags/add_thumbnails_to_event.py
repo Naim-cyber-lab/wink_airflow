@@ -21,6 +21,15 @@ from airflow.utils.dates import days_ago
 PARIS_TZ = ZoneInfo("Europe/Paris")
 DB_CONN_ID = "my_postgres"
 
+# Dans docker-compose: ./videos -> /opt/airflow/videos
+VIDEOS_DIR = Variable.get("THUMBS_OUTPUT_DIR", default_var="/opt/airflow/videos").strip()
+
+# Préfixe à ajouter devant les noms .mp4 venant de la BDD
+MEDIAFILES_BASE_URL = Variable.get(
+    "MEDIAFILES_BASE_URL",
+    default_var="https://api.nisu.fr/mediafiles/",
+).strip()
+
 default_args = {
     "owner": "airflow",
     "retries": 1,
@@ -59,32 +68,34 @@ def download_file(url: str, dst_path: str, chunk_size: int = 1024 * 1024) -> str
 
 def build_video_url_or_path(video_value: str) -> str:
     """
-    Dans ta BDD (profil_filesevent.video), on voit souvent juste un nom de fichier .mp4.
-    - Si c'est déjà une URL -> on la retourne
-    - Sinon on tente:
-        1) un chemin local (Variable VIDEO_LOCAL_DIR)
-        2) une URL base (Variable VIDEO_BASE_URL)
+    Dans ta BDD (profil_filesevent.video), tu as souvent juste un nom de fichier .mp4.
+    Règle demandée:
+      - Si c'est une URL -> on la retourne
+      - Sinon -> on préfixe avec https://api.nisu.fr/mediafiles/
     """
     if not video_value:
         return ""
 
+    video_value = str(video_value).strip()
+
     if is_url(video_value):
         return video_value
 
-    video_value = str(video_value).lstrip("/")
+    # Assure un seul slash
+    base = MEDIAFILES_BASE_URL.rstrip("/") + "/"
+    filename = video_value.lstrip("/")
+    return base + filename
 
-    local_dir = Variable.get("VIDEO_LOCAL_DIR", default_var="").strip()
-    if local_dir:
-        local_path = os.path.join(local_dir, video_value)
-        if os.path.exists(local_path):
-            return local_path
 
-    base_url = Variable.get("VIDEO_BASE_URL", default_var="").strip()
-    if base_url:
-        return base_url.rstrip("/") + "/" + video_value
-
-    # fallback: on retourne tel quel (peut être un chemin relatif)
-    return video_value
+def _safe_stem(name: str) -> str:
+    """Nettoie un nom de fichier (sans extension) pour éviter caractères bizarres."""
+    keep = []
+    for ch in name:
+        if ch.isalnum() or ch in ("-", "_"):
+            keep.append(ch)
+        else:
+            keep.append("_")
+    return "".join(keep).strip("_") or "file"
 
 
 def extract_thumbnails(
@@ -96,7 +107,8 @@ def extract_thumbnails(
     jpeg_quality: int = 90,
 ) -> list[str]:
     """
-    Extrait EXACTEMENT `total_thumbs` thumbnails répartis sur la vidéo (indépendant de la durée).
+    Extrait EXACTEMENT `total_thumbs` thumbnails répartis sur la vidéo.
+    - Si video_input est une URL, la vidéo est téléchargée en temporaire puis lue par OpenCV.
     Retourne les chemins ABSOLUS des images générées.
     """
     out_dir_abs = os.path.abspath(out_dir)
@@ -168,25 +180,31 @@ def extract_thumbnails(
 
 def generate_thumbnails_for_event(event_id: int, video_value: str) -> list[str]:
     """
-    Génère EXACTEMENT 2 thumbnails et renvoie une liste de NOMS de fichiers (pas les chemins).
-    Stockage local: /tmp/airflow_thumbs/<event_id>/
+    Génère EXACTEMENT 2 thumbnails et renvoie une liste de NOMS de fichiers.
+    IMPORTANT: écrit DIRECTEMENT dans /opt/airflow/videos (sans sous-dossier).
+    Les noms sont uniques pour éviter collisions.
     """
     video_src = build_video_url_or_path(video_value)
     if not video_src:
         return []
 
-    out_dir = os.path.join("/tmp", "airflow_thumbs", str(event_id))
+    os.makedirs(VIDEOS_DIR, exist_ok=True)
+
+    base = os.path.basename(str(video_value))  # ex: abc123.mp4
+    stem = _safe_stem(os.path.splitext(base)[0])
+
+    # Exemple: event_517_abc123_00000.jpg et event_517_abc123_00001.jpg
+    prefix = f"event_{event_id}_{stem}"
 
     thumbs_paths = extract_thumbnails(
         video_input=video_src,
-        out_dir=out_dir,
+        out_dir=VIDEOS_DIR,  # <-- DIRECTEMENT dans videos/
         total_thumbs=int(Variable.get("THUMBS_PER_VIDEO", default_var="2")),
         image_format=Variable.get("THUMBS_FORMAT", default_var="jpg"),
-        prefix=f"event_{event_id}",
+        prefix=prefix,
         jpeg_quality=int(Variable.get("THUMBS_JPEG_QUALITY", default_var="90")),
     )
 
-    # On renvoie uniquement les noms de fichiers
     return [os.path.basename(p) for p in thumbs_paths]
 
 
@@ -217,9 +235,7 @@ def fetch_events_missing_thumbnails(limit: int = 200) -> list[tuple[int, str]]:
 
 
 def update_event_thumbnails(event_id: int, thumbnails: list[str]) -> None:
-    """
-    Met à jour profil_event.thumbnails (type text) avec un JSON texte (liste de noms de fichiers).
-    """
+    """Met à jour profil_event.thumbnails (text) avec un JSON texte (liste de noms de fichiers)."""
     sql = "UPDATE profil_event SET thumbnails = %s WHERE id = %s"
     payload = json.dumps(thumbnails, ensure_ascii=False)
 
@@ -236,7 +252,8 @@ def update_event_thumbnails(event_id: int, thumbnails: list[str]) -> None:
 def add_thumbnails_to_event(**_context):
     """
     - récupère les events sans thumbnails
-    - génère 2 thumbnails depuis la vidéo associée
+    - génère 2 thumbnails depuis l'URL https://api.nisu.fr/mediafiles/<nom_video>
+    - écrit les thumbnails DIRECTEMENT dans /opt/airflow/videos
     - met à jour profil_event.thumbnails (JSON texte)
     """
     limit = int(Variable.get("THUMBS_BATCH_LIMIT", default_var="200"))
@@ -247,6 +264,8 @@ def add_thumbnails_to_event(**_context):
         return
 
     logging.info("Événements à traiter: %s", len(rows))
+    logging.info("Dossier de sortie thumbnails: %s", VIDEOS_DIR)
+    logging.info("MEDIAFILES_BASE_URL: %s", MEDIAFILES_BASE_URL)
 
     processed = 0
     skipped = 0
@@ -255,14 +274,14 @@ def add_thumbnails_to_event(**_context):
     for event_id, video_value in rows:
         try:
             thumbs = generate_thumbnails_for_event(event_id, video_value)
-            if len(thumbs) == 0:
+            if not thumbs:
                 skipped += 1
                 logging.warning("Event %s: aucune thumbnail générée (video=%s)", event_id, video_value)
                 continue
 
             update_event_thumbnails(event_id, thumbs)
             processed += 1
-            logging.info("Event %s: %s thumbnails -> DB OK (ex: %s)", event_id, len(thumbs), thumbs)
+            logging.info("Event %s: %s thumbnails -> DB OK (%s)", event_id, len(thumbs), thumbs)
 
         except Exception as e:
             failed += 1
@@ -274,7 +293,7 @@ def add_thumbnails_to_event(**_context):
 # ================== DAG ==================
 with DAG(
     dag_id="profil_event_generate_thumbnails",
-    description="Génère 2 thumbnails depuis profil_filesevent.video et les stocke dans profil_event.thumbnails",
+    description="Génère 2 thumbnails par vidéo (URL api.nisu.fr/mediafiles/) et les écrit directement dans /opt/airflow/videos",
     default_args=default_args,
     start_date=days_ago(1),
     catchup=False,
