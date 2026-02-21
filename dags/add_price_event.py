@@ -1,7 +1,7 @@
 import logging
 import re
 from datetime import timedelta
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import psycopg2
@@ -37,31 +37,69 @@ def _pg_connect():
 
 
 # ================== PRICE PARSER ==================
+def _clean_text(text: str) -> str:
+    if not text:
+        return ""
+    t = text.replace("\u202f", " ").replace("\xa0", " ")
+    for d in ["–", "—", "−", "‐", "‒"]:
+        t = t.replace(d, "-")
+    return t
+
+
+def _to_float(s: str) -> float:
+    return float(s.replace(",", "."))
+
+
+def _pick_best_single_by_context(t: str, singles: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Heuristique:
+      - Si un mot-clé type 'Prix', 'Tarif', 'L’addition', 'entrée', etc. est présent,
+        on prend le premier prix après ce mot-clé (dans une fenêtre).
+      - Sinon: on prend le MAX des prix (cas resto: 9€, 3€, 11€ => 11€)
+    """
+    if not singles:
+        return None
+
+    # Fenêtre pour chercher un prix après un mot clé
+    anchors = [
+        "prix", "tarif", "l’addition", "l'addition", "addition", "entrée", "entree", "démarre", "demarre"
+    ]
+
+    low = t.lower()
+    for a in anchors:
+        idx = low.find(a)
+        if idx != -1:
+            window = t[idx: idx + 180]  # petite fenêtre après le mot-clé
+            # reprends les mêmes regex "single" pour la fenêtre
+            single_re = re.compile(
+                r"""(?P<val>\d{1,4}(?:[.,]\d{1,2})?)\s*(?P<cur>€|eur|euros?)(?!\w)""",
+                re.IGNORECASE | re.VERBOSE,
+            )
+            m = single_re.search(window)
+            if m:
+                return {
+                    "type": "single",
+                    "value": _to_float(m.group("val")),
+                    "currency": "EUR",
+                    "raw": m.group(0).strip(),
+                }
+
+    # fallback: max value
+    return max(singles, key=lambda x: x.get("value", 0.0))
+
+
 def extract_price_info(text: str) -> Dict[str, Any]:
     """
     Extrait une info prix depuis un texte FR.
     Retour:
-      {
-        "mentions": [...],
-        "best": { ... } | None
-      }
-    best:
-      - type=single: {"type":"single","value":12.0,"currency":"EUR","raw":"12€"}
-      - type=range: {"type":"range","min":10.0,"max":20.0|None,"currency":"EUR","raw":"entre 10 et 20€","operator":"between|range|max|min"}
-      - type=free:  {"type":"free","value":0.0,"currency":"EUR","raw":"gratuit"}
-      - type=scale: {"type":"scale","scale":"€€","raw":"€€"}
+      {"mentions": [...], "best": {...}|None}
     """
     if not text:
         return {"mentions": [], "best": None}
 
-    t = text.replace("\u202f", " ").replace("\xa0", " ")
-    for d in ["–", "—", "−", "‐", "‒"]:
-        t = t.replace(d, "-")
+    t = _clean_text(text)
 
     free_re = re.compile(r"\b(gratuit(?:e)?|free|entrée\s+libre|entree\s+libre)\b", re.IGNORECASE)
-
-    def to_float(s: str) -> float:
-        return float(s.replace(",", "."))
 
     less_re = re.compile(
         r"""\b(?:moins\s+de|à\s+moins\s+de|<)\s*(?P<val>\d{1,4}(?:[.,]\d{1,2})?)\s*(?P<cur>€|eur|euros?)(?!\w)""",
@@ -89,81 +127,103 @@ def extract_price_info(text: str) -> Dict[str, Any]:
     )
     euro_scale_re = re.compile(r"(?<!\w)(€{1,4})(?!\w)")
 
-    mentions = []
-
+    # Collect mentions (debug/audit)
+    mentions: List[str] = []
     for rx in [between_re, range_re, less_re, upto_re, from_re, single_re, euro_scale_re]:
         for m in rx.finditer(t):
             mentions.append(m.group(0).strip())
 
-    if free_re.search(t):
-        best = {"type": "free", "value": 0.0, "currency": "EUR", "raw": free_re.search(t).group(0).strip()}
-    else:
-        best = None
-
-        m = between_re.search(t)
-        if m:
-            best = {
-                "type": "range",
-                "min": to_float(m.group("min")),
-                "max": to_float(m.group("max")),
-                "currency": "EUR",
-                "raw": m.group(0).strip(),
-                "operator": "between",
-            }
-        else:
-            m = range_re.search(t)
-            if m:
-                best = {
-                    "type": "range",
-                    "min": to_float(m.group("min")),
-                    "max": to_float(m.group("max")),
-                    "currency": "EUR",
-                    "raw": m.group(0).strip(),
-                    "operator": "range",
-                }
-            else:
-                m = less_re.search(t) or upto_re.search(t)
-                if m:
-                    best = {
-                        "type": "range",
-                        "min": 0.0,
-                        "max": to_float(m.group("val")),
-                        "currency": "EUR",
-                        "raw": m.group(0).strip(),
-                        "operator": "max",
-                    }
-                else:
-                    m = from_re.search(t)
-                    if m:
-                        best = {
-                            "type": "range",
-                            "min": to_float(m.group("val")),
-                            "max": None,
-                            "currency": "EUR",
-                            "raw": m.group(0).strip(),
-                            "operator": "min",
-                        }
-                    else:
-                        ms = euro_scale_re.search(t)
-                        if ms:
-                            best = {"type": "scale", "scale": ms.group(1), "raw": ms.group(1)}
-                        else:
-                            m2 = single_re.search(t)
-                            if m2:
-                                best = {
-                                    "type": "single",
-                                    "value": to_float(m2.group("val")),
-                                    "currency": "EUR",
-                                    "raw": m2.group(0).strip(),
-                                }
-
+    # Unique mentions
     uniq, seen = [], set()
     for x in mentions:
         if x and x not in seen:
             uniq.append(x)
             seen.add(x)
 
-    return {"mentions": uniq, "best": best}
+    # 1) Gratuit
+    mfree = free_re.search(t)
+    if mfree:
+        return {"mentions": uniq, "best": {"type": "free", "value": 0.0, "currency": "EUR", "raw": mfree.group(0).strip()}}
+
+    # 2) Ranges en priorité
+    m = between_re.search(t)
+    if m:
+        return {
+            "mentions": uniq,
+            "best": {
+                "type": "range",
+                "min": _to_float(m.group("min")),
+                "max": _to_float(m.group("max")),
+                "currency": "EUR",
+                "raw": m.group(0).strip(),
+                "operator": "between",
+            },
+        }
+
+    m = range_re.search(t)
+    if m:
+        return {
+            "mentions": uniq,
+            "best": {
+                "type": "range",
+                "min": _to_float(m.group("min")),
+                "max": _to_float(m.group("max")),
+                "currency": "EUR",
+                "raw": m.group(0).strip(),
+                "operator": "range",
+            },
+        }
+
+    m = less_re.search(t) or upto_re.search(t)
+    if m:
+        return {
+            "mentions": uniq,
+            "best": {
+                "type": "range",
+                "min": 0.0,
+                "max": _to_float(m.group("val")),
+                "currency": "EUR",
+                "raw": m.group(0).strip(),
+                "operator": "max",
+            },
+        }
+
+    m = from_re.search(t)
+    if m:
+        return {
+            "mentions": uniq,
+            "best": {
+                "type": "range",
+                "min": _to_float(m.group("val")),
+                "max": None,
+                "currency": "EUR",
+                "raw": m.group(0).strip(),
+                "operator": "min",
+            },
+        }
+
+    # 3) Singles (plusieurs possibles)
+    singles: List[Dict[str, Any]] = []
+    for ms in single_re.finditer(t):
+        singles.append(
+            {
+                "type": "single",
+                "value": _to_float(ms.group("val")),
+                "currency": "EUR",
+                "raw": ms.group(0).strip(),
+            }
+        )
+
+    if singles:
+        best_single = _pick_best_single_by_context(t, singles)
+        return {"mentions": uniq, "best": best_single}
+
+    # 4) scale uniquement si aucun prix numérique
+    ms = euro_scale_re.search(t)
+    if ms:
+        return {"mentions": uniq, "best": {"type": "scale", "scale": ms.group(1), "raw": ms.group(1)}}
+
+    return {"mentions": uniq, "best": None}
 
 
 def normalize_price(best: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -172,6 +232,7 @@ def normalize_price(best: Optional[Dict[str, Any]]) -> Optional[str]:
         return None
 
     t = best.get("type")
+
     if t == "free":
         return "0€ (gratuit)"
 
@@ -206,16 +267,23 @@ def normalize_price(best: Optional[Dict[str, Any]]) -> Optional[str]:
         return best.get("raw")
 
     if t == "scale":
+        # on garde, mais normalement ça arrive seulement si aucun prix numérique
         return best.get("raw")
 
     return best.get("raw")
 
 
 # ================== DB QUERIES ==================
+BAD_PRICE_VALUES = ("€", "€€", "€€€", "€€€€", "eur", "euros")
+
+
 def fetch_events_missing_price(limit: int = 500):
     """
-    Events sans info prix:
-      - "priceEvent" NULL/'' ET price NULL/''
+    On traite:
+      - price NULL/'' OU price dans valeurs inutiles
+      - OU "priceEvent" NULL/'' OU "priceEvent" dans valeurs inutiles
+    IMPORTANT: schéma actuel => "bioEvent_fr", "bioEvent", "priceEvent", "prixInitial" existent (CamelCase),
+               et price est une colonne snake_case.
     """
     sql = """
         SELECT
@@ -227,8 +295,11 @@ def fetch_events_missing_price(limit: int = 500):
             COALESCE("priceEvent", '') AS priceevent,
             COALESCE(price, '') AS price
         FROM profil_event
-        WHERE ("priceEvent" IS NULL OR "priceEvent" = '')
-          AND (price IS NULL OR price = '')
+        WHERE
+            (
+                price IS NULL OR price = '' OR price = ANY(%s)
+                OR "priceEvent" IS NULL OR "priceEvent" = '' OR "priceEvent" = ANY(%s)
+            )
           AND (
                 COALESCE(titre_fr,'') <> ''
              OR COALESCE("bioEvent_fr",'') <> ''
@@ -240,7 +311,7 @@ def fetch_events_missing_price(limit: int = 500):
     conn = _pg_connect()
     try:
         with conn.cursor() as cur:
-            cur.execute(sql, (limit,))
+            cur.execute(sql, (list(BAD_PRICE_VALUES), list(BAD_PRICE_VALUES), limit))
             return cur.fetchall()
     finally:
         conn.close()
@@ -257,7 +328,6 @@ def update_event_price(
       - "priceEvent" (raw trouvé)
       - price (normalisé)
       - "prixInitial" uniquement si valeur fournie
-    IMPORTANT: colonnes CamelCase entre guillemets.
     """
     if prix_initial_value is None:
         sql = 'UPDATE profil_event SET "priceEvent" = %s, price = %s WHERE id = %s'
@@ -274,18 +344,14 @@ def update_event_price(
     finally:
         conn.close()
 
+
 # ================== AIRFLOW TASK ==================
 def add_price_to_event(**_context):
-    """
-    - récupère les events sans prix
-    - extrait un prix depuis titre_fr/bioevent_fr/bioevent
-    - met à jour priceevent + price (+ prixinitial si pertinent)
-    """
     limit = int(Variable.get("PRICE_BATCH_LIMIT", default_var="500"))
     rows = fetch_events_missing_price(limit=limit)
 
     if not rows:
-        logging.info("Aucun événement à traiter (prix déjà présents).")
+        logging.info("Aucun événement à traiter (prix déjà présents ou pas de texte).")
         return
 
     processed = 0
@@ -294,9 +360,12 @@ def add_price_to_event(**_context):
 
     for r in rows:
         try:
-            event_id, titre_fr, bio_fr, bio, prix_initial, _, _ = r
+            event_id, titre_fr, bio_fr, bio, prix_initial, current_priceevent, current_price = r
 
             text = "\n".join([titre_fr, bio_fr, bio]).strip()
+            if not text:
+                skipped += 1
+                continue
 
             info = extract_price_info(text)
             best = info.get("best")
@@ -306,12 +375,18 @@ def add_price_to_event(**_context):
                 continue
 
             price_norm = normalize_price(best)
-            if not price_norm:
+            if not price_norm or price_norm.strip() in BAD_PRICE_VALUES:
                 skipped += 1
                 continue
 
-            price_event_raw = best.get("raw") or price_norm
+            price_event_raw = (best.get("raw") or price_norm).strip()
 
+            # Protection: ne jamais écrire un raw vide ou juste "€"
+            if not price_event_raw or price_event_raw in BAD_PRICE_VALUES:
+                # si raw est nul/€ mais normalize est OK, on force le raw à normalize
+                price_event_raw = price_norm
+
+            # Remplir prixInitial seulement si c'est vide/0
             prix_initial_to_write = None
             try:
                 current_pi = float(prix_initial or 0)
@@ -330,17 +405,19 @@ def add_price_to_event(**_context):
 
             update_event_price(
                 event_id=int(event_id),
-                price_event_raw=str(price_event_raw)[:455],  # max_length priceEvent (Django)
+                price_event_raw=str(price_event_raw)[:455],  # max_length "priceEvent"
                 price_norm=str(price_norm)[:255],            # max_length price
                 prix_initial_value=prix_initial_to_write,
             )
 
             processed += 1
             logging.info(
-                "Event %s: priceevent=%s | price=%s | prixinitial=%s",
+                "Event %s updated: old(price=%r, priceEvent=%r) -> new(price=%r, priceEvent=%r, prixInitial=%r)",
                 event_id,
-                price_event_raw,
+                current_price,
+                current_priceevent,
                 price_norm,
+                price_event_raw,
                 prix_initial_to_write,
             )
 
@@ -354,7 +431,7 @@ def add_price_to_event(**_context):
 # ================== DAG ==================
 with DAG(
     dag_id="profil_event_fill_prices",
-    description="Complète profil_event.price/priceevent (et éventuellement prixinitial) depuis titre_fr, bioevent_fr, bioevent",
+    description='Complète profil_event.price + "priceEvent" (+ "prixInitial") depuis titre_fr, "bioEvent_fr", "bioEvent"',
     default_args=default_args,
     start_date=days_ago(1),
     catchup=False,
