@@ -1,4 +1,3 @@
-import json
 import logging
 import re
 from datetime import timedelta
@@ -6,7 +5,6 @@ from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
 import psycopg2
-
 from airflow import DAG
 from airflow.hooks.base import BaseHook
 from airflow.models import Variable
@@ -60,7 +58,6 @@ def extract_price_info(text: str) -> Dict[str, Any]:
     for d in ["–", "—", "−", "‐", "‒"]:
         t = t.replace(d, "-")
 
-    # Gratuit / free
     free_re = re.compile(r"\b(gratuit(?:e)?|free|entrée\s+libre|entree\s+libre)\b", re.IGNORECASE)
 
     def to_float(s: str) -> float:
@@ -94,16 +91,15 @@ def extract_price_info(text: str) -> Dict[str, Any]:
 
     mentions = []
 
-    # Collect mentions (ordre important)
     for rx in [between_re, range_re, less_re, upto_re, from_re, single_re, euro_scale_re]:
         for m in rx.finditer(t):
             mentions.append(m.group(0).strip())
 
-    # Best match
     if free_re.search(t):
         best = {"type": "free", "value": 0.0, "currency": "EUR", "raw": free_re.search(t).group(0).strip()}
     else:
         best = None
+
         m = between_re.search(t)
         if m:
             best = {
@@ -161,7 +157,6 @@ def extract_price_info(text: str) -> Dict[str, Any]:
                                     "raw": m2.group(0).strip(),
                                 }
 
-    # Unique mentions
     uniq, seen = [], set()
     for x in mentions:
         if x and x not in seen:
@@ -179,32 +174,38 @@ def normalize_price(best: Optional[Dict[str, Any]]) -> Optional[str]:
     t = best.get("type")
     if t == "free":
         return "0€ (gratuit)"
+
     if t == "single":
         v = best.get("value")
         if v is None:
             return None
-        # évite 12.0 => 12
         vv = int(v) if float(v).is_integer() else v
         return f"{vv}€"
+
     if t == "range":
         mn, mx = best.get("min"), best.get("max")
         op = best.get("operator")
+
         if op == "min" and mn is not None:
             vv = int(mn) if float(mn).is_integer() else mn
             return f"à partir de {vv}€"
+
         if op == "max" and mx is not None:
             vv = int(mx) if float(mx).is_integer() else mx
             return f"jusqu'à {vv}€"
+
         if mn is not None and mx is not None:
             a = int(mn) if float(mn).is_integer() else mn
             b = int(mx) if float(mx).is_integer() else mx
             return f"{a}–{b}€"
+
         if mn is not None and mx is None:
             a = int(mn) if float(mn).is_integer() else mn
             return f"à partir de {a}€"
+
         return best.get("raw")
+
     if t == "scale":
-        # "€€" => on garde
         return best.get("raw")
 
     return best.get("raw")
@@ -214,25 +215,26 @@ def normalize_price(best: Optional[Dict[str, Any]]) -> Optional[str]:
 def fetch_events_missing_price(limit: int = 500):
     """
     On vise les events sans info prix:
-      - priceEvent NULL/'' ET price NULL/''
-    On prend les champs texte pour extraction + prixInitial pour éventuellement le remplir.
+      - priceevent NULL/'' ET price NULL/''
+    On prend les champs texte pour extraction + prixinitial pour éventuellement le remplir.
+    IMPORTANT: colonnes Postgres en snake_case (bioevent_fr, bioevent, priceevent, prixinitial).
     """
     sql = """
         SELECT
             id,
             COALESCE(titre_fr, '') AS titre_fr,
-            COALESCE(bioEvent_fr, '') AS bioEvent_fr,
-            COALESCE(bioEvent, '') AS bioEvent,
-            COALESCE(prixInitial, 0) AS prixInitial,
-            COALESCE(priceEvent, '') AS priceEvent,
+            COALESCE(bioevent_fr, '') AS bioevent_fr,
+            COALESCE(bioevent, '') AS bioevent,
+            COALESCE(prixinitial, 0) AS prixinitial,
+            COALESCE(priceevent, '') AS priceevent,
             COALESCE(price, '') AS price
         FROM profil_event
-        WHERE (priceEvent IS NULL OR priceEvent = '')
+        WHERE (priceevent IS NULL OR priceevent = '')
           AND (price IS NULL OR price = '')
           AND (
                 COALESCE(titre_fr,'') <> ''
-             OR COALESCE(bioEvent_fr,'') <> ''
-             OR COALESCE(bioEvent,'') <> ''
+             OR COALESCE(bioevent_fr,'') <> ''
+             OR COALESCE(bioevent,'') <> ''
           )
         ORDER BY id ASC
         LIMIT %s
@@ -246,18 +248,23 @@ def fetch_events_missing_price(limit: int = 500):
         conn.close()
 
 
-def update_event_price(event_id: int, price_event_raw: str, price_norm: str, prix_initial_value: Optional[float]) -> None:
+def update_event_price(
+    event_id: int,
+    price_event_raw: str,
+    price_norm: str,
+    prix_initial_value: Optional[float],
+) -> None:
     """
     Met à jour:
-      - priceEvent (raw trouvé)
+      - priceevent (raw trouvé)
       - price (normalisé)
-      - prixInitial uniquement si valeur fournie (et qu'on veut l'écrire)
+      - prixinitial uniquement si valeur fournie (et qu'on veut l'écrire)
     """
     if prix_initial_value is None:
-        sql = "UPDATE profil_event SET priceEvent = %s, price = %s WHERE id = %s"
+        sql = "UPDATE profil_event SET priceevent = %s, price = %s WHERE id = %s"
         params = (price_event_raw, price_norm, event_id)
     else:
-        sql = "UPDATE profil_event SET priceEvent = %s, price = %s, prixInitial = %s WHERE id = %s"
+        sql = "UPDATE profil_event SET priceevent = %s, price = %s, prixinitial = %s WHERE id = %s"
         params = (price_event_raw, price_norm, float(prix_initial_value), event_id)
 
     conn = _pg_connect()
@@ -273,8 +280,8 @@ def update_event_price(event_id: int, price_event_raw: str, price_norm: str, pri
 def add_price_to_event(**_context):
     """
     - récupère les events sans prix
-    - extrait un prix depuis titre_fr/bioEvent_fr/bioEvent
-    - met à jour priceEvent + price (+ prixInitial si pertinent)
+    - extrait un prix depuis titre_fr/bioevent_fr/bioevent
+    - met à jour priceevent + price (+ prixinitial si pertinent)
     """
     limit = int(Variable.get("PRICE_BATCH_LIMIT", default_var="500"))
     rows = fetch_events_missing_price(limit=limit)
@@ -291,7 +298,6 @@ def add_price_to_event(**_context):
         try:
             event_id, titre_fr, bio_fr, bio, prix_initial, _, _ = r
 
-            # Texte source: on met le FR en priorité
             text = "\n".join([titre_fr, bio_fr, bio]).strip()
 
             info = extract_price_info(text)
@@ -308,7 +314,6 @@ def add_price_to_event(**_context):
 
             price_event_raw = best.get("raw") or price_norm
 
-            # Remplir prixInitial seulement si c'est encore vide/0
             prix_initial_to_write = None
             try:
                 current_pi = float(prix_initial or 0)
@@ -319,7 +324,6 @@ def add_price_to_event(**_context):
                 if best.get("type") == "single":
                     prix_initial_to_write = float(best["value"])
                 elif best.get("type") == "range":
-                    # si "à partir de X€" ou "X–Y€", on prend min
                     mn = best.get("min")
                     if mn is not None:
                         prix_initial_to_write = float(mn)
@@ -328,14 +332,19 @@ def add_price_to_event(**_context):
 
             update_event_price(
                 event_id=int(event_id),
-                price_event_raw=str(price_event_raw)[:455],   # respecte max_length=455 de priceEvent
-                price_norm=str(price_norm)[:255],             # respecte max_length=255 de price
+                price_event_raw=str(price_event_raw)[:455],  # max_length priceEvent (Django)
+                price_norm=str(price_norm)[:255],            # max_length price
                 prix_initial_value=prix_initial_to_write,
             )
 
             processed += 1
-            logging.info("Event %s: priceEvent=%s | price=%s | prixInitial=%s",
-                         event_id, price_event_raw, price_norm, prix_initial_to_write)
+            logging.info(
+                "Event %s: priceevent=%s | price=%s | prixinitial=%s",
+                event_id,
+                price_event_raw,
+                price_norm,
+                prix_initial_to_write,
+            )
 
         except Exception as e:
             failed += 1
@@ -347,7 +356,7 @@ def add_price_to_event(**_context):
 # ================== DAG ==================
 with DAG(
     dag_id="profil_event_fill_prices",
-    description="Complète profil_event.price/priceEvent (et éventuellement prixInitial) depuis titre_fr, bioEvent_fr, bioEvent",
+    description="Complète profil_event.price/priceevent (et éventuellement prixinitial) depuis titre_fr, bioevent_fr, bioevent",
     default_args=default_args,
     start_date=days_ago(1),
     catchup=False,
