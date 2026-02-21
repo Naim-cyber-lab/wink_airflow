@@ -223,18 +223,18 @@ def fetch_events_missing_price(limit: int = 500):
         SELECT
             id,
             COALESCE(titre_fr, '') AS titre_fr,
-            COALESCE(bioevent_fr, '') AS bioevent_fr,
-            COALESCE(bioevent, '') AS bioevent,
-            COALESCE(prixinitial, 0) AS prixinitial,
-            COALESCE(priceevent, '') AS priceevent,
+            COALESCE("bioEvent_fr", '') AS bioevent_fr,
+            COALESCE("bioEvent", '') AS bioevent,
+            COALESCE("prixInitial", 0) AS prixinitial,
+            COALESCE("priceEvent", '') AS priceevent,
             COALESCE(price, '') AS price
         FROM profil_event
-        WHERE (priceevent IS NULL OR priceevent = '')
+        WHERE ("priceEvent" IS NULL OR "priceEvent" = '')
           AND (price IS NULL OR price = '')
           AND (
                 COALESCE(titre_fr,'') <> ''
-             OR COALESCE(bioevent_fr,'') <> ''
-             OR COALESCE(bioevent,'') <> ''
+             OR COALESCE("bioEvent_fr",'') <> ''
+             OR COALESCE("bioEvent",'') <> ''
           )
         ORDER BY id ASC
         LIMIT %s
