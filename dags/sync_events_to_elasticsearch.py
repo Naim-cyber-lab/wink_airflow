@@ -186,12 +186,23 @@ def index_events_to_es(ti, **_):
     es = get_es_client()
     actions: List[Dict[str, Any]] = []
 
+    skipped_no_id = 0
+    skipped_embedding_error = 0
+    skipped_localisation_error = 0
+
     for row in rows:
         # mapping safe: s'arrête au min des deux longueurs
         m = min(len(COL_NAMES), len(row))
         rec = {COL_NAMES[i]: row[i] for i in range(m)}
 
         event_id = rec.get("id")
+
+        # ── GUARD: _id ES ne peut pas être None ──────────────────────────────
+        if event_id is None:
+            skipped_no_id += 1
+            logging.warning("[SKIP] event_id=None -> row ignorée: %s", rec)
+            continue
+
         winker_id = rec.get("winker_id")
 
         titre = (rec.get("titre") or "").strip()
@@ -202,9 +213,17 @@ def index_events_to_es(ti, **_):
         preferences = _parse_preferences(rec.get("preferences"))
         boost = _safe_int(rec.get("boost"), default=0)
 
-        localisation = _build_localisation(rec.get("lat"), rec.get("lon"))
+        # ── Localisation ──────────────────────────────────────────────────────
+        raw_lat, raw_lon = rec.get("lat"), rec.get("lon")
+        localisation = _build_localisation(raw_lat, raw_lon)
+        if (raw_lat is not None or raw_lon is not None) and localisation is None:
+            skipped_localisation_error += 1
+            logging.warning(
+                "[WARN] event_id=%s localisation invalide (lat=%r lon=%r) -> champ omis",
+                event_id, raw_lat, raw_lon,
+            )
 
-        # embeddings: priorité FR si dispo, sinon fallback EN
+        # ── Embedding ─────────────────────────────────────────────────────────
         preferences_text = ", ".join(preferences) if preferences else ""
         merged_text = " ".join(
             [x for x in [titre_fr or titre, bio_fr or bio, preferences_text] if x]
@@ -214,12 +233,25 @@ def index_events_to_es(ti, **_):
         if merged_text:
             try:
                 merged_vec = _embedding(merged_text)
+                if merged_vec and len(merged_vec) != EMBEDDING_DIMS:
+                    logging.warning(
+                        "[WARN] event_id=%s embedding ignoré: dims=%s attendu=%s",
+                        event_id, len(merged_vec), EMBEDDING_DIMS,
+                    )
+                    merged_vec = []
             except Exception as e:
-                logging.exception("Erreur embedding event_id=%s: %s", event_id, e)
+                skipped_embedding_error += 1
+                logging.warning(
+                    "[WARN] event_id=%s erreur embedding -> embedding omis: %s",
+                    event_id, e,
+                )
                 merged_vec = []
+        else:
+            logging.info("[INFO] event_id=%s merged_text vide -> pas d'embedding", event_id)
 
+        # ── Construction du document ──────────────────────────────────────────
         doc: Dict[str, Any] = {
-            "event_id": str(event_id) if event_id is not None else None,
+            "event_id": str(event_id),
             "winkerId": str(winker_id) if winker_id is not None else None,
             "boost": boost,
             "titre": titre,
@@ -235,7 +267,11 @@ def index_events_to_es(ti, **_):
         if merged_vec:
             doc["embedding_vector"] = merged_vec
 
-        # _id ES = id event (upsert)
+        logging.debug(
+            "[DOC] event_id=%s titre=%r has_localisation=%s has_embedding=%s preferences=%s",
+            event_id, titre, localisation is not None, bool(merged_vec), preferences,
+        )
+
         actions.append(
             {
                 "_op_type": "index",
@@ -245,8 +281,44 @@ def index_events_to_es(ti, **_):
             }
         )
 
-    helpers.bulk(es, actions)
-    logging.info("Indexation terminée: %d docs -> index=%s", len(actions), INDEX_NAME)
+    logging.info(
+        "📦 Préparation terminée: %d actions | skipped no_id=%d embedding_err=%d localisation_err=%d",
+        len(actions), skipped_no_id, skipped_embedding_error, skipped_localisation_error,
+    )
+
+    if not actions:
+        logging.warning("Aucune action à envoyer à Elasticsearch.")
+        return
+
+    # ── Bulk avec logging détaillé des erreurs (ne crash plus sur échecs partiels) ──
+    success, errors = helpers.bulk(
+        es,
+        actions,
+        raise_on_error=False,
+        raise_on_exception=False,
+    )
+
+    logging.info(
+        "✅ Indexation terminée: %d succès / %d total -> index=%s",
+        success, len(actions), INDEX_NAME,
+    )
+
+    if errors:
+        logging.warning("❌ %d document(s) en erreur lors du bulk:", len(errors))
+        for err in errors:
+            # err est de la forme: {"index": {"_id": "...", "error": {...}, "status": ...}}
+            op = next(iter(err.values()), {})
+            doc_id = op.get("_id", "?")
+            status = op.get("status", "?")
+            error_detail = op.get("error", {})
+            error_type = error_detail.get("type", "?")
+            error_reason = error_detail.get("reason", "?")
+            logging.warning(
+                "  → _id=%s status=%s type=%s reason=%s",
+                doc_id, status, error_type, error_reason,
+            )
+            # Log complet pour debug approfondi
+            logging.debug("  → full error: %s", json.dumps(err, ensure_ascii=False))
 
 
 with DAG(
