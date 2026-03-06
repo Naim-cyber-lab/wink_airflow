@@ -218,7 +218,7 @@ def fetch_events_missing_thumbnails(limit: int = 200) -> list[tuple[int, str]]:
         SELECT e.id AS event_id, f.video AS video
         FROM profil_event e
         JOIN profil_filesevent f ON f.event_id = e.id
-        WHERE e.thumbnails IS NULL
+        WHERE e.thumbnails IS NULL OR e.thumbnails = ''
           AND f.video IS NOT NULL
           AND f.video <> ''
         ORDER BY e.id ASC
