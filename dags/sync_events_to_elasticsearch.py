@@ -47,6 +47,15 @@ SELECT
 FROM profil_event;
 """
 
+SQL_SELECT_FILES = """
+SELECT
+  event_id,
+  array_agg(image) FILTER (WHERE image IS NOT NULL AND image <> '') AS images,
+  array_agg(video) FILTER (WHERE video IS NOT NULL AND video <> '') AS videos
+FROM profil_filesevent
+GROUP BY event_id;
+"""
+
 # Doit matcher l'ordre exact du SELECT ci-dessus (11 colonnes)
 COL_NAMES = [
     "id",
@@ -148,6 +157,33 @@ def _parse_thumbnails(value: Any) -> List[str]:
     return []
 
 
+def _parse_files(value: Any) -> List[str]:
+    """
+    Colonne image ou video depuis profil_filesevent.
+    Peut être un tableau Postgres (array_agg), une string JSON, ou None.
+    Retourne une list[str] (vide si invalide/vide).
+    """
+    if value is None:
+        return []
+
+    if isinstance(value, list):
+        return [str(x) for x in value if x]
+
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return []
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, list):
+                return [str(x) for x in parsed if x]
+        except Exception:
+            logging.warning("[WARN] files: impossible de parser le JSON: %r", s[:100])
+        return []
+
+    return []
+
+
 def _embedding(text: str) -> List[float]:
     """
     Appelle le service FastAPI exposé dans Swagger:
@@ -202,6 +238,20 @@ def index_events_to_es(ti, **_):
         logging.info("Aucun event à indexer.")
         return
 
+    # ── Construire le dict files: { event_id -> { images, videos } } ─────────
+    files_rows = ti.xcom_pull(task_ids="fetch_files_from_postgres") or []
+    files_by_event: Dict[str, Dict[str, List[str]]] = {}
+    for frow in files_rows:
+        # colonnes: event_id, images, videos
+        if len(frow) < 3:
+            continue
+        eid = str(frow[0])
+        files_by_event[eid] = {
+            "images": _parse_files(frow[1]),
+            "videos": _parse_files(frow[2]),
+        }
+    logging.info("Fichiers chargés pour %d events", len(files_by_event))
+
     logging.info("Nombre total de rows récupérées: %d", len(rows))
 
     first_row = rows[0]
@@ -247,6 +297,11 @@ def index_events_to_es(ti, **_):
 
         # ── Thumbnails ────────────────────────────────────────────────────────
         thumbnails = _parse_thumbnails(rec.get("thumbnails"))
+
+        # ── Images & Videos (depuis profil_filesevent) ────────────────────────
+        event_files = files_by_event.get(str(event_id), {})
+        images = event_files.get("images", [])
+        videos = event_files.get("videos", [])
 
         # ── Localisation ──────────────────────────────────────────────────────
         raw_lat, raw_lon = rec.get("lat"), rec.get("lon")
@@ -305,9 +360,15 @@ def index_events_to_es(ti, **_):
         if thumbnails:
             doc["thumbnails"] = thumbnails
 
+        if images:
+            doc["image"] = images
+
+        if videos:
+            doc["video"] = videos
+
         logging.debug(
-            "[DOC] event_id=%s titre=%r has_localisation=%s has_embedding=%s thumbnails=%d preferences=%s",
-            event_id, titre, localisation is not None, bool(merged_vec), len(thumbnails), preferences,
+            "[DOC] event_id=%s titre=%r has_localisation=%s has_embedding=%s thumbnails=%d images=%d videos=%d preferences=%s",
+            event_id, titre, localisation is not None, bool(merged_vec), len(thumbnails), len(images), len(videos), preferences,
         )
 
         actions.append(
@@ -375,9 +436,16 @@ with DAG(
         do_xcom_push=True,
     )
 
+    fetch_files_from_postgres = PostgresOperator(
+        task_id="fetch_files_from_postgres",
+        postgres_conn_id="my_postgres",
+        sql=SQL_SELECT_FILES,
+        do_xcom_push=True,
+    )
+
     index_events_to_elasticsearch = PythonOperator(
         task_id="index_events_to_elasticsearch",
         python_callable=index_events_to_es,
     )
 
-    fetch_events_from_postgres >> index_events_to_elasticsearch
+    [fetch_events_from_postgres, fetch_files_from_postgres] >> index_events_to_elasticsearch
