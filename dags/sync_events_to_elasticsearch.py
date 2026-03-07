@@ -42,11 +42,12 @@ SELECT
   "hastagEvents" AS preferences,
   0 AS boost,
   lat,
-  lon
+  lon,
+  thumbnails
 FROM profil_event;
 """
 
-# Doit matcher l'ordre exact du SELECT ci-dessus (10 colonnes)
+# Doit matcher l'ordre exact du SELECT ci-dessus (11 colonnes)
 COL_NAMES = [
     "id",
     "winker_id",
@@ -58,6 +59,7 @@ COL_NAMES = [
     "boost",
     "lat",
     "lon",
+    "thumbnails",
 ]
 
 
@@ -114,6 +116,36 @@ def _parse_preferences(value: Any) -> List[str]:
 
     s = str(value).strip()
     return [s.lstrip("#")] if s else []
+
+
+
+def _parse_thumbnails(value: Any) -> List[str]:
+    """
+    thumbnails: colonne JSON Postgres contenant une liste d'URLs (strings).
+    Ex: ["event_955_foo_00000.jpg", "event_955_foo_00001.jpg"]
+    Retourne une list[str] (vide si invalide/vide).
+    """
+    if value is None:
+        return []
+
+    # Déjà une liste (Postgres a déjà désérialisé le JSON)
+    if isinstance(value, list):
+        return [str(x) for x in value if x]
+
+    # String JSON à parser
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return []
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, list):
+                return [str(x) for x in parsed if x]
+        except Exception:
+            logging.warning("[WARN] thumbnails: impossible de parser le JSON: %r", s[:100])
+        return []
+
+    return []
 
 
 def _embedding(text: str) -> List[float]:
@@ -213,6 +245,9 @@ def index_events_to_es(ti, **_):
         preferences = _parse_preferences(rec.get("preferences"))
         boost = _safe_int(rec.get("boost"), default=0)
 
+        # ── Thumbnails ────────────────────────────────────────────────────────
+        thumbnails = _parse_thumbnails(rec.get("thumbnails"))
+
         # ── Localisation ──────────────────────────────────────────────────────
         raw_lat, raw_lon = rec.get("lat"), rec.get("lon")
         localisation = _build_localisation(raw_lat, raw_lon)
@@ -267,9 +302,12 @@ def index_events_to_es(ti, **_):
         if merged_vec:
             doc["embedding_vector"] = merged_vec
 
+        if thumbnails:
+            doc["thumbnails"] = thumbnails
+
         logging.debug(
-            "[DOC] event_id=%s titre=%r has_localisation=%s has_embedding=%s preferences=%s",
-            event_id, titre, localisation is not None, bool(merged_vec), preferences,
+            "[DOC] event_id=%s titre=%r has_localisation=%s has_embedding=%s thumbnails=%d preferences=%s",
+            event_id, titre, localisation is not None, bool(merged_vec), len(thumbnails), preferences,
         )
 
         actions.append(
