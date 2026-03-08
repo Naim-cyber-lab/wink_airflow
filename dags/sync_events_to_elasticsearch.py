@@ -313,31 +313,37 @@ def index_events_to_es(ti, **_):
                 event_id, raw_lat, raw_lon,
             )
 
-        # ── Embedding ─────────────────────────────────────────────────────────
+        # ── Embeddings séparés (titre_vector, bio_vector, preferences_vector) ──
         preferences_text = ", ".join(preferences) if preferences else ""
-        merged_text = " ".join(
-            [x for x in [titre_fr or titre, bio_fr or bio, preferences_text] if x]
-        ).strip()
+        titre_text = (titre_fr or titre).strip()
+        bio_text = (bio_fr or bio).strip()
 
-        merged_vec: List[float] = []
-        if merged_text:
+        def _safe_embedding(text: str, field: str) -> List[float]:
+            if not text:
+                return []
             try:
-                merged_vec = _embedding(merged_text)
-                if merged_vec and len(merged_vec) != EMBEDDING_DIMS:
+                vec = _embedding(text)
+                if vec and len(vec) != EMBEDDING_DIMS:
                     logging.warning(
-                        "[WARN] event_id=%s embedding ignoré: dims=%s attendu=%s",
-                        event_id, len(merged_vec), EMBEDDING_DIMS,
+                        "[WARN] event_id=%s field=%s embedding ignoré: dims=%s attendu=%s",
+                        event_id, field, len(vec), EMBEDDING_DIMS,
                     )
-                    merged_vec = []
+                    return []
+                return vec
             except Exception as e:
-                skipped_embedding_error += 1
                 logging.warning(
-                    "[WARN] event_id=%s erreur embedding -> embedding omis: %s",
-                    event_id, e,
+                    "[WARN] event_id=%s field=%s erreur embedding -> omis: %s",
+                    event_id, field, e,
                 )
-                merged_vec = []
-        else:
-            logging.info("[INFO] event_id=%s merged_text vide -> pas d'embedding", event_id)
+                return []
+
+        titre_vec = _safe_embedding(titre_text, "titre_vector")
+        bio_vec = _safe_embedding(bio_text, "bio_vector")
+        preferences_vec = _safe_embedding(preferences_text, "preferences_vector")
+
+        if not any([titre_vec, bio_vec, preferences_vec]):
+            skipped_embedding_error += 1
+            logging.info("[INFO] event_id=%s aucun embedding produit", event_id)
 
         # ── Construction du document ──────────────────────────────────────────
         doc: Dict[str, Any] = {
@@ -354,8 +360,12 @@ def index_events_to_es(ti, **_):
         if localisation:
             doc["localisation"] = localisation
 
-        if merged_vec:
-            doc["embedding_vector"] = merged_vec
+        if titre_vec:
+            doc["titre_vector"] = titre_vec
+        if bio_vec:
+            doc["bio_vector"] = bio_vec
+        if preferences_vec:
+            doc["preferences_vector"] = preferences_vec
 
         if thumbnails:
             doc["thumbnails"] = thumbnails
@@ -367,8 +377,9 @@ def index_events_to_es(ti, **_):
             doc["video"] = videos
 
         logging.debug(
-            "[DOC] event_id=%s titre=%r has_localisation=%s has_embedding=%s thumbnails=%d images=%d videos=%d preferences=%s",
-            event_id, titre, localisation is not None, bool(merged_vec), len(thumbnails), len(images), len(videos), preferences,
+            "[DOC] event_id=%s titre=%r has_localisation=%s titre_vec=%s bio_vec=%s pref_vec=%s thumbnails=%d images=%d videos=%d",
+            event_id, titre, localisation is not None, bool(titre_vec), bool(bio_vec), bool(preferences_vec),
+            len(thumbnails), len(images), len(videos),
         )
 
         actions.append(
