@@ -150,8 +150,9 @@ def load_and_validate(**context):
 # ── Task 2 : update DB ────────────────────────────────────────────────────────
 
 def update_price_columns(**context):
+    import io
     rows_json = context["ti"].xcom_pull(key="rows_json")
-    rows = pd.read_json(rows_json, orient="records").to_dict(orient="records")
+    rows = pd.read_json(io.StringIO(rows_json), orient="records").to_dict(orient="records")
     logging.info("🚀 [db] Update de %s events...", len(rows))
 
     conn_meta  = BaseHook.get_connection(DB_CONN_ID)
@@ -195,12 +196,16 @@ def update_price_columns(**context):
                 logging.warning("[db] SKIP — id invalide=%r | titre=%r", event_id, _short(titre))
                 continue
 
-            # Valeurs prix
-            price_event    = safe_str(row.get("priceEvent"))   or None
+            # Valeurs prix — tronquées aux limites varchar de la DB
+            price_event    = (safe_str(row.get("priceEvent"))   or None)
             prix_initial   = safe_float(row.get("prixInitial"))
             prix_reduction = safe_float(row.get("prixReduction"))
             contain_reduc  = safe_bool(row.get("containReduction"))
-            price_summary  = safe_str(row.get("price_summary")) or None
+            price_summary  = (safe_str(row.get("price_summary")) or None)
+
+            # Tronquer pour respecter les limites varchar
+            if price_event   and len(price_event)   > 455: price_event   = price_event[:455]
+            if price_summary and len(price_summary) > 255: price_summary = price_summary[:255]
 
             # ══════════════════════════════════════════════════════════════
             # UPDATE — UNIQUEMENT CES 6 COLONNES, rien d'autre
