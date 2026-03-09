@@ -43,7 +43,12 @@ SELECT
   0 AS boost,
   lat,
   lon,
-  thumbnails
+  thumbnails,
+  "priceEvent"       AS price_event,
+  "prixInitial"      AS prix_initial,
+  "prixReduction"    AS prix_reduction,
+  "containReduction" AS contain_reduction,
+  price_summary
 FROM profil_event;
 """
 
@@ -69,6 +74,11 @@ COL_NAMES = [
     "lat",
     "lon",
     "thumbnails",
+    "price_event",
+    "prix_initial",
+    "prix_reduction",
+    "contain_reduction",
+    "price_summary",
 ]
 
 
@@ -295,6 +305,32 @@ def index_events_to_es(ti, **_):
         preferences = _parse_preferences(rec.get("preferences"))
         boost = _safe_int(rec.get("boost"), default=0)
 
+        # ── Champs prix ───────────────────────────────────────────────────────
+        price_event     = (rec.get("price_event") or "").strip() or None
+        prix_initial    = rec.get("prix_initial")
+        prix_reduction  = rec.get("prix_reduction")
+        contain_reduc   = rec.get("contain_reduction")
+        price_summary   = (rec.get("price_summary") or "").strip() or None
+
+        try:
+            prix_initial   = float(prix_initial)   if prix_initial   not in (None, "", "nan") else None
+        except Exception:
+            prix_initial   = None
+        try:
+            prix_reduction = float(prix_reduction) if prix_reduction not in (None, "", "nan") else None
+        except Exception:
+            prix_reduction = None
+
+        is_free = (prix_initial == 0.0) or (price_event or "").lower() == "gratuit"
+
+        if contain_reduc is not None:
+            try:
+                contain_reduc = str(contain_reduc).lower() in ("true", "1", "yes")
+            except Exception:
+                contain_reduc = False
+        else:
+            contain_reduc = False
+
         # ── Thumbnails ────────────────────────────────────────────────────────
         thumbnails = _parse_thumbnails(rec.get("thumbnails"))
 
@@ -375,6 +411,14 @@ def index_events_to_es(ti, **_):
 
         if videos:
             doc["video"] = videos
+
+        # ── Prix ──────────────────────────────────────────────────────────────
+        if price_event    is not None: doc["priceEvent"]       = price_event
+        if prix_initial   is not None: doc["prixInitial"]      = prix_initial
+        if prix_reduction is not None: doc["prixReduction"]    = prix_reduction
+        doc["containReduction"] = contain_reduc
+        doc["isFree"]           = is_free
+        if price_summary  is not None: doc["price_summary"]    = price_summary
 
         logging.debug(
             "[DOC] event_id=%s titre=%r has_localisation=%s titre_vec=%s bio_vec=%s pref_vec=%s thumbnails=%d images=%d videos=%d",
