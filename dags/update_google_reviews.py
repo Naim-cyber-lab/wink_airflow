@@ -1,12 +1,13 @@
-import asyncio
 import json
 import logging
 import re
+import time
 from datetime import timedelta
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse, quote_plus
+from urllib.parse import parse_qs, urlencode, urlparse, quote_plus
 from zoneinfo import ZoneInfo
 
 import psycopg2
+import requests
 
 from airflow import DAG
 from airflow.hooks.base import BaseHook
@@ -19,10 +20,27 @@ from airflow.utils.dates import days_ago
 PARIS_TZ = ZoneInfo("Europe/Paris")
 DB_CONN_ID = "my_postgres"
 
+API_URL = "https://www.google.com/httpservice/web/PrivateLocalSearchUiDataService/GetLocalBoqProxy"
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "fr-FR,fr;q=0.9",
+    "Referer": "https://www.google.com/",
+    # Cookies de consentement pour éviter la page consent.google.com
+    "Cookie": (
+        "CONSENT=YES+cb.20231020-07-p0.fr+FX+NW; "
+        "SOCS=CAESEwgDEgk0OTc5NzMwNzIaAmZyIAEaBgiAnMezBg"
+    ),
+}
+
 default_args = {
     "owner": "airflow",
-    "retries": 1,
-    "retry_delay": timedelta(minutes=5),
+    "retries": 2,
+    "retry_delay": timedelta(minutes=3),
 }
 
 
@@ -84,55 +102,25 @@ def update_event_reviews_in_db(event_id: int, reviews: list[dict]) -> None:
 
 
 # ================== URL HELPERS ==================
-def normalize_google_reviews_url(url: str) -> str:
+def extract_stick_and_hl(url: str) -> tuple[str | None, str]:
     """
-    Garantit que l'URL pointe vers la page des avis locaux Google.
+    Extrait le paramètre `stick` (identifiant du lieu) et `hl` depuis
+    n'importe quelle URL Google Search pointant vers un lieu.
 
-    Deux cas possibles dans la BDD :
-      1. URL déjà correcte avec #lkt=LocalPoiReviews  → retournée telle quelle
-      2. URL de recherche Google simple (sans fragment) → on force tbm=lcl
-         et on ajoute le fragment #lkt=LocalPoiReviews
-
-    Exemples :
-      "https://www.google.com/search?q=Virtual+Room+...+Avis&tbm=lcl"
-        → "https://www.google.com/search?q=Virtual+Room+...+Avis&tbm=lcl#lkt=LocalPoiReviews"
-
-      "https://www.google.com/search?q=LE+K1ZE+...&tbm=lcl#lkt=LocalPoiReviews"
-        → inchangée
+    Fonctionne avec :
+      - https://www.google.com/search?q=...&stick=H4sI...&tbm=lcl
+      - https://www.google.com/search?q=...&stick=H4sI...&tbm=lcl#lkt=LocalPoiReviews
     """
-    if not url:
-        return url
-
-    # Déjà au bon format
-    if "#lkt=LocalPoiReviews" in url:
-        return url
-
     parsed = urlparse(url)
-
-    # Sécurité : ne toucher qu'aux URLs Google
-    if "google." not in parsed.netloc:
-        return url
-
-    # Reconstruire les params en forçant tbm=lcl
     params = parse_qs(parsed.query, keep_blank_values=True)
-    params["tbm"] = ["lcl"]
 
-    new_query = urlencode(
-        {k: v[0] for k, v in params.items()},
-        quote_via=quote_plus,
-    )
+    stick = params.get("stick", [None])[0]
+    hl    = params.get("hl", ["fr-FR"])[0]
 
-    return urlunparse((
-        parsed.scheme,
-        parsed.netloc,
-        parsed.path,
-        parsed.params,
-        new_query,
-        "lkt=LocalPoiReviews",   # fragment
-    ))
+    return stick, hl
 
 
-# ================== SCRAPER ==================
+# ================== SCRAPER (HTTP pur, sans Playwright) ==================
 def _parse_reviews_from_body(body: str) -> list[dict]:
     """
     Parse la réponse JSON de l'endpoint GetLocalBoqProxy.
@@ -166,90 +154,90 @@ def _parse_reviews_from_body(body: str) -> list[dict]:
     return reviews
 
 
-async def _scrape_reviews_async(url: str, max_reviews: int) -> list[dict]:
+def _get_next_token(body: str) -> str | None:
+    """Extrait le token de pagination depuis data[1][10][6]."""
+    try:
+        body_clean = re.sub(r"^\)\]\}'\n?", "", body)
+        data = json.loads(body_clean)
+        token = data[1][10][6]
+        return token if isinstance(token, str) and token else None
+    except Exception:
+        return None
+
+
+def scrape_reviews(url: str, max_reviews: int, delay: float = 1.0) -> list[dict]:
     """
-    Lance Playwright, intercepte les réponses GetLocalBoqProxy
-    et accumule les avis par scroll jusqu'à max_reviews.
+    Récupère les avis Google via des appels HTTP directs à GetLocalBoqProxy.
+    Pagine automatiquement grâce au next_token jusqu'à max_reviews.
+
+    Args:
+        url         : URL Google Search du lieu (avec ou sans #lkt=LocalPoiReviews)
+        max_reviews : Nombre max d'avis à récupérer
+        delay       : Délai entre chaque appel paginé (secondes)
     """
-    from playwright.async_api import async_playwright
+    stick, hl = extract_stick_and_hl(url)
+
+    if not stick:
+        raise ValueError(f"Paramètre 'stick' introuvable dans l'URL : {url}")
 
     all_reviews: list[dict] = []
-    seen: set[tuple] = set()
+    seen: set[tuple]        = set()
+    next_token: str | None  = None
+    page_num = 0
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
+    while len(all_reviews) < max_reviews:
+        page_num += 1
+
+        # Construire les paramètres de la requête
+        api_params: dict = {"hl": hl, "stick": stick}
+        if next_token:
+            api_params["pageToken"] = next_token
+
+        resp = requests.get(
+            API_URL,
+            params=api_params,
+            headers=HEADERS,
+            timeout=15,
         )
-        context = await browser.new_context(
-            locale="fr-FR",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 900},
+        resp.raise_for_status()
+
+        body = resp.text
+
+        # Parser les avis de cette page
+        try:
+            batch = _parse_reviews_from_body(body)
+        except Exception as exc:
+            logging.warning("Page %d : erreur de parsing (%s)", page_num, exc)
+            break
+
+        if not batch:
+            logging.info("Page %d : aucun avis, fin de pagination.", page_num)
+            break
+
+        # Dédupliquer et accumuler
+        added = 0
+        for r in batch:
+            key = (r["author"], r["date"])
+            if key not in seen:
+                seen.add(key)
+                all_reviews.append(r)
+                added += 1
+
+        logging.info(
+            "Page %d : +%d avis (total %d)", page_num, added, len(all_reviews)
         )
-        # Cookies de consentement pour bypasser consent.google.com
-        await context.add_cookies([
-            {"name": "CONSENT", "value": "YES+cb.20231020-07-p0.fr+FX+NW",
-             "domain": ".google.com", "path": "/"},
-            {"name": "SOCS",    "value": "CAESEwgDEgk0OTc5NzMwNzIaAmZyIAEaBgiAnMezBg",
-             "domain": ".google.com", "path": "/"},
-        ])
 
-        page = await context.new_page()
+        # Récupérer le token de la page suivante
+        next_token = _get_next_token(body)
+        if not next_token:
+            logging.info("Page %d : plus de token de pagination, arrêt.", page_num)
+            break
 
-        async def on_response(response):
-            if (
-                "GetLocalBoqProxy" not in response.url
-                and "PrivateLocalSearch" not in response.url
-            ):
-                return
-            try:
-                body = await response.text()
-                if "il y a" not in body and "ago" not in body:
-                    return
-                for r in _parse_reviews_from_body(body):
-                    key = (r["author"], r["date"])
-                    if key not in seen:
-                        seen.add(key)
-                        all_reviews.append(r)
-            except Exception:
-                pass
-
-        page.on("response", on_response)
-
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(3)
-
-        stale_count = 0
-        prev_count  = 0
-        scroll_y    = 0
-
-        while len(all_reviews) < max_reviews:
-            scroll_y += 400
-            await page.evaluate(f"window.scrollTo(0, {scroll_y})")
-            await asyncio.sleep(1.5)
-
-            if len(all_reviews) == prev_count:
-                stale_count += 1
-            else:
-                stale_count = 0
-                prev_count  = len(all_reviews)
-
-            # Arrêt si plus rien ne charge après 5 scrolls consécutifs
-            if stale_count >= 5:
-                break
-
-        await browser.close()
+        # Pause pour ne pas surcharger Google
+        if len(all_reviews) < max_reviews:
+            time.sleep(delay)
 
     return all_reviews[:max_reviews]
-
-
-def scrape_reviews(url: str, max_reviews: int) -> list[dict]:
-    """Wrapper synchrone pour appeler le scraper async depuis Airflow."""
-    return asyncio.run(_scrape_reviews_async(url, max_reviews))
 
 
 # ================== AIRFLOW TASK ==================
@@ -260,15 +248,14 @@ def update_google_reviews(**_context):
       - google_reviews est encore vide (jamais scrappé)
 
     Pour chaque event :
-      1. Normalise l'URL (ajoute tbm=lcl + #lkt=LocalPoiReviews si absent)
-      2. Scrape les avis Google via Playwright
-      3. Met à jour google_reviews + google_reviews_updated_at
-
-    Si aucun avis n'est trouvé, on écrit [] avec timestamp pour éviter
-    de re-tenter indéfiniment les events sans avis.
+      1. Extrait le paramètre `stick` de l'URL (identifiant du lieu)
+      2. Appelle directement l'API GetLocalBoqProxy en HTTP pur (pas de Playwright)
+      3. Pagine automatiquement pour récupérer max_reviews avis
+      4. Met à jour google_reviews + google_reviews_updated_at dans profil_event
     """
     limit       = int(Variable.get("GOOGLE_REVIEWS_BATCH_LIMIT",   default_var="200"))
     max_reviews = int(Variable.get("GOOGLE_REVIEWS_MAX_PER_EVENT", default_var="20"))
+    delay       = float(Variable.get("GOOGLE_REVIEWS_DELAY_SEC",   default_var="1.0"))
 
     rows = fetch_events_to_scrape(limit=limit)
 
@@ -277,27 +264,28 @@ def update_google_reviews(**_context):
         return
 
     logging.info(
-        "%d événement(s) à scraper (max %d avis chacun)",
-        len(rows), max_reviews,
+        "%d événement(s) à scraper (max %d avis chacun, délai %.1fs entre pages)",
+        len(rows), max_reviews, delay,
     )
 
     processed = skipped = failed = 0
 
-    for event_id, raw_url in rows:
-        # Normaliser l'URL avant de scraper
-        url = normalize_google_reviews_url(raw_url)
-
-        if url != raw_url:
-            logging.info(
-                "Event %s : URL normalisée\n  avant : %s\n  après : %s",
-                event_id, raw_url, url,
-            )
-
+    for event_id, url in rows:
         try:
-            reviews = scrape_reviews(url, max_reviews)
+            # Vérifier que le paramètre stick est présent dans l'URL
+            stick, _ = extract_stick_and_hl(url)
+            if not stick:
+                skipped += 1
+                logging.warning(
+                    "Event %s : paramètre 'stick' absent dans l'URL (%s), ignoré.",
+                    event_id, url,
+                )
+                continue
+
+            reviews = scrape_reviews(url, max_reviews, delay=delay)
 
             if not reviews:
-                # Aucun avis trouvé : on horodate quand même pour ne pas re-tenter
+                # Aucun avis : on horodate pour ne pas re-tenter indéfiniment
                 update_event_reviews_in_db(event_id, [])
                 skipped += 1
                 logging.warning(
@@ -324,8 +312,8 @@ with DAG(
     dag_id="profil_event_update_google_reviews",
     description=(
         "Pour chaque event ayant urlGoogleMapsAvis renseignée et google_reviews vide, "
-        "normalise l'URL, scrape les avis Google et met à jour "
-        "google_reviews + google_reviews_updated_at dans profil_event."
+        "appelle directement l'API Google GetLocalBoqProxy (HTTP pur, sans navigateur) "
+        "et met à jour google_reviews + google_reviews_updated_at dans profil_event."
     ),
     default_args=default_args,
     start_date=days_ago(1),
