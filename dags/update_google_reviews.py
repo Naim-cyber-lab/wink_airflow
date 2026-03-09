@@ -3,6 +3,7 @@ import json
 import logging
 import re
 from datetime import timedelta
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse, quote_plus
 from zoneinfo import ZoneInfo
 
 import psycopg2
@@ -80,6 +81,55 @@ def update_event_reviews_in_db(event_id: int, reviews: list[dict]) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+# ================== URL HELPERS ==================
+def normalize_google_reviews_url(url: str) -> str:
+    """
+    Garantit que l'URL pointe vers la page des avis locaux Google.
+
+    Deux cas possibles dans la BDD :
+      1. URL déjà correcte avec #lkt=LocalPoiReviews  → retournée telle quelle
+      2. URL de recherche Google simple (sans fragment) → on force tbm=lcl
+         et on ajoute le fragment #lkt=LocalPoiReviews
+
+    Exemples :
+      "https://www.google.com/search?q=Virtual+Room+...+Avis&tbm=lcl"
+        → "https://www.google.com/search?q=Virtual+Room+...+Avis&tbm=lcl#lkt=LocalPoiReviews"
+
+      "https://www.google.com/search?q=LE+K1ZE+...&tbm=lcl#lkt=LocalPoiReviews"
+        → inchangée
+    """
+    if not url:
+        return url
+
+    # Déjà au bon format
+    if "#lkt=LocalPoiReviews" in url:
+        return url
+
+    parsed = urlparse(url)
+
+    # Sécurité : ne toucher qu'aux URLs Google
+    if "google." not in parsed.netloc:
+        return url
+
+    # Reconstruire les params en forçant tbm=lcl
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    params["tbm"] = ["lcl"]
+
+    new_query = urlencode(
+        {k: v[0] for k, v in params.items()},
+        quote_via=quote_plus,
+    )
+
+    return urlunparse((
+        parsed.scheme,
+        parsed.netloc,
+        parsed.path,
+        parsed.params,
+        new_query,
+        "lkt=LocalPoiReviews",   # fragment
+    ))
 
 
 # ================== SCRAPER ==================
@@ -209,12 +259,13 @@ def update_google_reviews(**_context):
       - urlGoogleMapsAvis est renseignée
       - google_reviews est encore vide (jamais scrappé)
 
-    Pour chaque event éligible, scrape les avis Google et met à jour :
-      - google_reviews            (JSON texte, liste d'avis)
-      - google_reviews_updated_at (timestamp NOW())
+    Pour chaque event :
+      1. Normalise l'URL (ajoute tbm=lcl + #lkt=LocalPoiReviews si absent)
+      2. Scrape les avis Google via Playwright
+      3. Met à jour google_reviews + google_reviews_updated_at
 
-    Si aucun avis n'est trouvé pour un event, on écrit quand même '[]'
-    et on horodate pour éviter de re-tenter indéfiniment.
+    Si aucun avis n'est trouvé, on écrit [] avec timestamp pour éviter
+    de re-tenter indéfiniment les events sans avis.
     """
     limit       = int(Variable.get("GOOGLE_REVIEWS_BATCH_LIMIT",   default_var="200"))
     max_reviews = int(Variable.get("GOOGLE_REVIEWS_MAX_PER_EVENT", default_var="20"))
@@ -232,7 +283,16 @@ def update_google_reviews(**_context):
 
     processed = skipped = failed = 0
 
-    for event_id, url in rows:
+    for event_id, raw_url in rows:
+        # Normaliser l'URL avant de scraper
+        url = normalize_google_reviews_url(raw_url)
+
+        if url != raw_url:
+            logging.info(
+                "Event %s : URL normalisée\n  avant : %s\n  après : %s",
+                event_id, raw_url, url,
+            )
+
         try:
             reviews = scrape_reviews(url, max_reviews)
 
@@ -264,7 +324,8 @@ with DAG(
     dag_id="profil_event_update_google_reviews",
     description=(
         "Pour chaque event ayant urlGoogleMapsAvis renseignée et google_reviews vide, "
-        "scrape les avis Google et met à jour google_reviews + google_reviews_updated_at."
+        "normalise l'URL, scrape les avis Google et met à jour "
+        "google_reviews + google_reviews_updated_at dans profil_event."
     ),
     default_args=default_args,
     start_date=days_ago(1),
