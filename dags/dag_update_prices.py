@@ -22,8 +22,12 @@ DB_CONN_ID = "my_postgres"
 
 CONFIDENCE_OK = {"high", "medium", "low"}
 
+# Chemin vers le fichier Excel produit par le notebook laptop
+# Monté via le volume Docker : ./data -> /opt/airflow/data
+DEFAULT_EXCEL_PATH = "/opt/airflow/data/profil_event_prices.xls"
 
-# ── Helpers (même style que ton DAG existant) ─────────────────────────────────
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def safe_str(x) -> str:
     if x is None:
@@ -93,50 +97,57 @@ def _get_table_columns(cursor, table: str) -> set[str]:
     return {r[0] for r in cursor.fetchall()}
 
 
-# ── Task 1 : charger et valider le CSV ───────────────────────────────────────
+def _read_excel_or_csv(path: str) -> pd.DataFrame:
+    """Lit .xls, .xlsx ou .csv automatiquement."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".xls", ".xlsx"):
+        return pd.read_excel(path, dtype=str)
+    return pd.read_csv(path, dtype=str)
+
+
+# ── Task 1 : charger et valider le fichier ────────────────────────────────────
 
 def load_and_validate(**context):
-    params   = context["params"]
-    csv_path = params["csv_path"]
+    params    = context["params"]
+    file_path = params.get("excel_path", DEFAULT_EXCEL_PATH)
 
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"CSV introuvable : {csv_path}")
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(
+            f"Fichier introuvable : {file_path}\n"
+            f"Vérifie que le volume Docker monte bien ./data -> /opt/airflow/data"
+        )
 
-    df = pd.read_csv(csv_path, dtype=str)
-    logging.info("📥 [load] CSV chargé : %s lignes depuis %s", len(df), csv_path)
+    df = _read_excel_or_csv(file_path)
+    logging.info("📥 [load] Fichier chargé : %s lignes depuis %s", len(df), file_path)
     logging.info("📥 [load] Colonnes : %s", list(df.columns))
 
     if "id" not in df.columns:
-        raise ValueError("Colonne 'id' manquante dans le CSV")
+        raise ValueError("Colonne 'id' manquante")
     if "confidence" not in df.columns:
-        raise ValueError("Colonne 'confidence' manquante — utilise le CSV produit par le notebook")
+        raise ValueError("Colonne 'confidence' manquante — utilise le fichier produit par le notebook")
 
-    # Stats par confidence
     logging.info("📊 [load] Distribution confidence :\n%s", df["confidence"].value_counts().to_string())
 
-    # Filtrer les lignes exploitables
     df_valid = df[df["confidence"].isin(CONFIDENCE_OK)].copy()
     df_skip  = df[~df["confidence"].isin(CONFIDENCE_OK)]
-    logging.info("✅ [load] %s lignes à updater | %s ignorées (not_found/error/NaN)", len(df_valid), len(df_skip))
-
-    # Aperçu des prix trouvés
+    logging.info("✅ [load] %s lignes à updater | %s ignorées", len(df_valid), len(df_skip))
     logging.info(
-        "🧪 [load] prix head :\n%s",
+        "🧪 [load] aperçu :\n%s",
         df_valid[["id", "titre", "priceEvent", "prixInitial", "confidence"]].head(10).to_string(index=False),
     )
 
     context["ti"].xcom_push(key="rows_json", value=df_valid.to_json(orient="records"))
-    context["ti"].xcom_push(key="total", value=len(df_valid))
+    context["ti"].xcom_push(key="total",     value=len(df_valid))
 
 
-# ── Task 2 : update DB (uniquement colonnes prix) ─────────────────────────────
+# ── Task 2 : update DB ────────────────────────────────────────────────────────
 
 def update_price_columns(**context):
     rows_json = context["ti"].xcom_pull(key="rows_json")
     rows = pd.read_json(rows_json, orient="records").to_dict(orient="records")
     logging.info("🚀 [db] Update de %s events...", len(rows))
 
-    conn_meta = BaseHook.get_connection(DB_CONN_ID)
+    conn_meta  = BaseHook.get_connection(DB_CONN_ID)
     connection = psycopg2.connect(
         host=conn_meta.host,
         port=conn_meta.port,
@@ -177,15 +188,16 @@ def update_price_columns(**context):
                 logging.warning("[db] SKIP — id invalide=%r | titre=%r", event_id, _short(titre))
                 continue
 
-            # ── Valeurs à écrire ─────────────────────────────────────────
+            # Valeurs prix
             price_event    = safe_str(row.get("priceEvent"))   or None
             prix_initial   = safe_float(row.get("prixInitial"))
             prix_reduction = safe_float(row.get("prixReduction"))
             contain_reduc  = safe_bool(row.get("containReduction"))
             price_summary  = safe_str(row.get("price_summary")) or None
 
-            # ── Construire l'update_map (seulement colonnes qui existent en DB) ──
-            # On ne touche RIEN d'autre que ces 6 colonnes
+            # ══════════════════════════════════════════════════════════════
+            # UPDATE — UNIQUEMENT CES 6 COLONNES, rien d'autre
+            # ══════════════════════════════════════════════════════════════
             update_map: dict[str, object] = {}
 
             if "priceEvent"       in db_cols and price_event    is not None:
@@ -237,7 +249,7 @@ def update_price_columns(**context):
     context["ti"].xcom_push(key="updated", value=updated)
     context["ti"].xcom_push(key="errors",  value=errors)
 
-    if errors > len(rows) * 0.1:
+    if errors > max(len(rows) * 0.1, 1):
         raise RuntimeError(f"Trop d'erreurs ({errors}/{len(rows)})")
 
 
@@ -261,22 +273,22 @@ default_args = {
 with DAG(
     dag_id="update_event_prices",
     start_date=days_ago(1),
-    schedule_interval=None,   # déclenché manuellement
+    schedule_interval=None,   # déclenché manuellement depuis l'UI
     catchup=False,
     default_args=default_args,
     tags=["event", "prices", "profil_event"],
     params={
-        "csv_path": Param(
-            "/opt/airflow/data/profil_event_prices.csv",
+        "excel_path": Param(
+            DEFAULT_EXCEL_PATH,
             type="string",
-            description="Chemin vers le CSV produit par le notebook laptop",
+            description="Chemin vers profil_event_prices.xls dans le conteneur (ex: /opt/airflow/data/profil_event_prices.xls)",
         ),
     },
 ) as dag:
     dag.timezone = PARIS_TZ
 
     t1 = PythonOperator(
-        task_id="load_and_validate_csv",
+        task_id="load_and_validate_excel",
         python_callable=load_and_validate,
         provide_context=True,
     )
