@@ -9,3 +9,5 @@ geopy
 pandas
 openpyxl==3.1.5
 opencv-python
+xlrd
+openpyxl
