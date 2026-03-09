@@ -24,7 +24,7 @@ CONFIDENCE_OK = {"high", "medium", "low"}
 
 # Chemin vers le fichier Excel produit par le notebook laptop
 # Monté via le volume Docker : ./data -> /opt/airflow/data
-DEFAULT_EXCEL_PATH = "/opt/airflow/data/profil_event_prices.xls"
+DEFAULT_EXCEL_PATH = "/opt/airflow/data/profil_event_prices.csv"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -100,8 +100,15 @@ def _get_table_columns(cursor, table: str) -> set[str]:
 def _read_excel_or_csv(path: str) -> pd.DataFrame:
     """Lit .xls, .xlsx ou .csv automatiquement."""
     ext = os.path.splitext(path)[1].lower()
-    if ext in (".xls", ".xlsx"):
-        return pd.read_excel(path, dtype=str)
+    if ext == ".xlsx":
+        return pd.read_excel(path, dtype=str, engine="openpyxl")
+    if ext == ".xls":
+        # Tente xlrd, sinon essaie de lire comme CSV (fichier renommé)
+        try:
+            return pd.read_excel(path, dtype=str, engine="xlrd")
+        except Exception:
+            logging.warning("⚠️ .xls illisible avec xlrd, lecture comme CSV...")
+            return pd.read_csv(path, dtype=str)
     return pd.read_csv(path, dtype=str)
 
 
@@ -281,7 +288,7 @@ with DAG(
         "excel_path": Param(
             DEFAULT_EXCEL_PATH,
             type="string",
-            description="Chemin vers profil_event_prices.xls dans le conteneur (ex: /opt/airflow/data/profil_event_prices.xls)",
+            description="Chemin vers le fichier CSV/Excel produit par le notebook (ex: /opt/airflow/data/profil_event_prices.csv)",
         ),
     },
 ) as dag:
