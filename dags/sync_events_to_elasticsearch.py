@@ -48,7 +48,8 @@ SELECT
   "prixInitial"      AS prix_initial,
   "prixReduction"    AS prix_reduction,
   "containReduction" AS contain_reduction,
-  price_summary
+  price_summary,
+  google_reviews
 FROM profil_event;
 """
 
@@ -79,6 +80,7 @@ COL_NAMES = [
     "prix_reduction",
     "contain_reduction",
     "price_summary",
+    "google_reviews",
 ]
 
 
@@ -194,7 +196,36 @@ def _parse_files(value: Any) -> List[str]:
     return []
 
 
-def _embedding(text: str) -> List[float]:
+def _parse_google_reviews(value: Any) -> List[dict]:
+    """
+    google_reviews: colonne JSONB Postgres contenant une liste d'objets avis.
+    Ex: [{"author": "...", "rating": 5, "date": "...", "text": "..."}]
+    Retourne une list[dict] (vide si invalide/vide/null).
+    """
+    if value is None:
+        return []
+
+    # Postgres a déjà désérialisé le JSONB en list
+    if isinstance(value, list):
+        return [r for r in value if isinstance(r, dict)]
+
+    # String JSON à parser (cas PostgresOperator qui renvoie du texte brut)
+    if isinstance(value, str):
+        s = value.strip()
+        if not s or s in ("[]", ""):
+            return []
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, list):
+                return [r for r in parsed if isinstance(r, dict)]
+        except Exception:
+            logging.warning("[WARN] google_reviews: impossible de parser le JSON: %r", s[:100])
+        return []
+
+    return []
+
+
+
     """
     Appelle le service FastAPI exposé dans Swagger:
     GET /embedding?text=...
@@ -334,6 +365,9 @@ def index_events_to_es(ti, **_):
         # ── Thumbnails ────────────────────────────────────────────────────────
         thumbnails = _parse_thumbnails(rec.get("thumbnails"))
 
+        # ── Google Reviews ────────────────────────────────────────────────────
+        google_reviews = _parse_google_reviews(rec.get("google_reviews"))
+
         # ── Images & Videos (depuis profil_filesevent) ────────────────────────
         event_files = files_by_event.get(str(event_id), {})
         images = event_files.get("images", [])
@@ -420,10 +454,13 @@ def index_events_to_es(ti, **_):
         doc["isFree"]           = is_free
         if price_summary  is not None: doc["price_summary"]    = price_summary
 
+        if google_reviews:
+            doc["google_reviews"] = google_reviews
+
         logging.debug(
-            "[DOC] event_id=%s titre=%r has_localisation=%s titre_vec=%s bio_vec=%s pref_vec=%s thumbnails=%d images=%d videos=%d",
+            "[DOC] event_id=%s titre=%r has_localisation=%s titre_vec=%s bio_vec=%s pref_vec=%s thumbnails=%d images=%d videos=%d google_reviews=%d",
             event_id, titre, localisation is not None, bool(titre_vec), bool(bio_vec), bool(preferences_vec),
-            len(thumbnails), len(images), len(videos),
+            len(thumbnails), len(images), len(videos), len(google_reviews),
         )
 
         actions.append(
