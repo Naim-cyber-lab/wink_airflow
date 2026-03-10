@@ -23,14 +23,19 @@ DB_CONN_ID = "my_postgres"
 
 API_URL = "https://www.google.com/httpservice/web/PrivateLocalSearchUiDataService/GetLocalBoqProxy"
 
-HEADERS = {
+# Headers qui simulent un vrai XHR depuis Google Search.
+# X-Same-Domain et X-Goog-Encode-Response-If-Executable sont obligatoires
+# pour que l'API accepte la requête (sinon -> 400).
+BASE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     ),
+    "Accept": "*/*",
     "Accept-Language": "fr-FR,fr;q=0.9",
-    "Referer": "https://www.google.com/",
+    "X-Same-Domain": "1",
+    "X-Goog-Encode-Response-If-Executable": "base64",
     "Cookie": (
         "CONSENT=YES+cb.20231020-07-p0.fr+FX+NW; "
         "SOCS=CAESEwgDEgk0OTc5NzMwNzIaAmZyIAEaBgiAnMezBg"
@@ -58,11 +63,11 @@ def _pg_connect():
 
 def fetch_events_to_scrape(limit: int) -> list[tuple[int, str]]:
     """
-    Récupère tous les events où :
-      - urlGoogleMapsAvis est renseignée (non null, non vide)
-      - le paramètre `stick` est présent dans l'URL (filtre LIKE)
+    Recupere les events ayant :
+      - urlGoogleMapsAvis renseignee
+      - le parametre `stick` ET `rldimm` dans l'URL (les deux sont requis par l'API)
 
-    ➜ Inclut les events déjà scrappés pour permettre la mise à jour régulière.
+    Ordre : jamais scrappe en premier, puis les plus anciens.
     """
     sql = """
         SELECT id, "urlGoogleMapsAvis"
@@ -70,8 +75,8 @@ def fetch_events_to_scrape(limit: int) -> list[tuple[int, str]]:
         WHERE "urlGoogleMapsAvis" IS NOT NULL
           AND "urlGoogleMapsAvis" <> ''
           AND "urlGoogleMapsAvis" LIKE '%%stick=%%'
+          AND "urlGoogleMapsAvis" LIKE '%%rldimm=%%'
         ORDER BY
-            -- Priorité aux events jamais scrappés
             google_reviews_updated_at ASC NULLS FIRST,
             id ASC
         LIMIT %s
@@ -86,7 +91,7 @@ def fetch_events_to_scrape(limit: int) -> list[tuple[int, str]]:
 
 
 def update_event_reviews_in_db(event_id: int, reviews: list[dict]) -> None:
-    """Sauvegarde les avis et la date de mise à jour dans profil_event."""
+    """Sauvegarde les avis et la date de mise a jour dans profil_event."""
     sql = """
         UPDATE profil_event
         SET google_reviews            = %s,
@@ -103,24 +108,31 @@ def update_event_reviews_in_db(event_id: int, reviews: list[dict]) -> None:
 
 
 # ================== URL HELPERS ==================
-def extract_stick_and_hl(url: str) -> tuple[str | None, str]:
+def extract_url_params(url: str) -> tuple[str | None, str, str | None]:
     """
-    Extrait le paramètre `stick` et `hl` depuis une URL Google Search.
-    Retourne (None, 'fr-FR') si le paramètre stick est absent.
+    Extrait depuis l'URL Google Search :
+      - stick  : identifiant encode du lieu (obligatoire)
+      - hl     : langue (defaut fr-FR)
+      - rldimm : identifiant numerique du lieu OBLIGATOIRE pour que
+                 GetLocalBoqProxy accepte la requete (sinon -> 400 Bad Request)
+
+    Exemple d'URL valide :
+      https://www.google.com/search?...&stick=H4sI...&rldimm=11800228875880652455&...
     """
     parsed = urlparse(url)
     params = parse_qs(parsed.query, keep_blank_values=True)
 
-    stick = params.get("stick", [None])[0]
-    hl    = params.get("hl", ["fr-FR"])[0]
+    stick  = params.get("stick",  [None])[0]
+    hl     = params.get("hl",     ["fr-FR"])[0]
+    rldimm = params.get("rldimm", [None])[0]
 
-    return stick, hl
+    return stick, hl, rldimm
 
 
 # ================== SCRAPER (HTTP pur) ==================
 def _parse_reviews_from_body(body: str) -> list[dict]:
     """
-    Parse la réponse JSON de l'endpoint GetLocalBoqProxy.
+    Parse la reponse JSON de l'endpoint GetLocalBoqProxy.
     Structure : data[1][10][2] = liste des avis
     """
     body_clean = re.sub(r"^\)\]\}'\n?", "", body)
@@ -163,13 +175,25 @@ def _get_next_token(body: str) -> str | None:
 
 def scrape_reviews(url: str, max_reviews: int, delay: float = 1.0) -> list[dict]:
     """
-    Récupère les avis Google via des appels HTTP directs à GetLocalBoqProxy.
-    Pagine automatiquement via next_token jusqu'à max_reviews.
+    Recupere les avis Google via des appels HTTP directs a GetLocalBoqProxy.
+
+    Parametres envoyes a l'API :
+      - hl     : langue
+      - stick  : identifiant du lieu (encode base64/protobuf)
+      - rldimm : identifiant numerique du lieu REQUIS pour eviter le 400
+
+    Le Referer est positionne dynamiquement sur l'URL d'origine pour
+    que Google considere la requete comme legitime.
     """
-    stick, hl = extract_stick_and_hl(url)
+    stick, hl, rldimm = extract_url_params(url)
 
     if not stick:
-        raise ValueError(f"Paramètre 'stick' introuvable dans l'URL : {url}")
+        raise ValueError(f"Parametre 'stick' introuvable dans l'URL : {url}")
+    if not rldimm:
+        raise ValueError(f"Parametre 'rldimm' introuvable dans l'URL : {url}")
+
+    # Le Referer doit pointer vers la page Google Search d'origine
+    headers = {**BASE_HEADERS, "Referer": url}
 
     all_reviews: list[dict] = []
     seen: set[tuple]        = set()
@@ -179,11 +203,16 @@ def scrape_reviews(url: str, max_reviews: int, delay: float = 1.0) -> list[dict]
     while len(all_reviews) < max_reviews:
         page_num += 1
 
-        api_params: dict = {"hl": hl, "stick": stick}
+        # rldimm est obligatoire des la premiere page pour valider la requete
+        api_params: dict = {
+            "hl":     hl,
+            "stick":  stick,
+            "rldimm": rldimm,
+        }
         if next_token:
             api_params["pageToken"] = next_token
 
-        resp = requests.get(API_URL, params=api_params, headers=HEADERS, timeout=15)
+        resp = requests.get(API_URL, params=api_params, headers=headers, timeout=15)
         resp.raise_for_status()
         body = resp.text
 
@@ -209,7 +238,7 @@ def scrape_reviews(url: str, max_reviews: int, delay: float = 1.0) -> list[dict]
 
         next_token = _get_next_token(body)
         if not next_token:
-            logging.info("Page %d : plus de token de pagination, arrêt.", page_num)
+            logging.info("Page %d : plus de token de pagination, arret.", page_num)
             break
 
         if len(all_reviews) < max_reviews:
@@ -221,17 +250,13 @@ def scrape_reviews(url: str, max_reviews: int, delay: float = 1.0) -> list[dict]
 # ================== AIRFLOW TASK ==================
 def update_google_reviews(**_context):
     """
-    Parcourt les events de profil_event qui ont un paramètre `stick` dans
-    urlGoogleMapsAvis — qu'ils aient déjà des avis ou non.
-
-    Ordre de traitement : jamais scrappés en premier (NULLS FIRST sur
-    google_reviews_updated_at), puis les plus anciens.
+    Parcourt les events de profil_event ayant stick ET rldimm dans leur URL.
 
     Pour chaque event :
-      1. Vérifie la présence du `stick` dans l'URL
-      2. Appelle directement l'API GetLocalBoqProxy (HTTP pur, sans navigateur)
-      3. Pagine pour récupérer jusqu'à max_reviews avis
-      4. Met à jour google_reviews + google_reviews_updated_at dans profil_event
+      1. Extrait stick + rldimm de l'URL
+      2. Appelle GetLocalBoqProxy (HTTP pur) avec les deux parametres
+      3. Pagine pour recuperer jusqu'a max_reviews avis
+      4. Met a jour google_reviews + google_reviews_updated_at dans profil_event
     """
     limit       = int(Variable.get("GOOGLE_REVIEWS_BATCH_LIMIT",   default_var="200"))
     max_reviews = int(Variable.get("GOOGLE_REVIEWS_MAX_PER_EVENT", default_var="20"))
@@ -240,11 +265,11 @@ def update_google_reviews(**_context):
     rows = fetch_events_to_scrape(limit=limit)
 
     if not rows:
-        logging.info("Aucun événement éligible (aucune URL avec paramètre 'stick').")
+        logging.info("Aucun evenement eligible (URLs sans 'stick' ou sans 'rldimm').")
         return
 
     logging.info(
-        "%d événement(s) à scraper (max %d avis chacun, délai %.1fs entre pages)",
+        "%d evenement(s) a scraper (max %d avis chacun, delai %.1fs entre pages)",
         len(rows), max_reviews, delay,
     )
 
@@ -252,34 +277,36 @@ def update_google_reviews(**_context):
 
     for event_id, url in rows:
         try:
-            stick, _ = extract_stick_and_hl(url)
-            if not stick:
-                # Ne devrait pas arriver grâce au filtre SQL LIKE, mais sécurité
+            stick, _, rldimm = extract_url_params(url)
+
+            if not stick or not rldimm:
                 skipped += 1
                 logging.warning(
-                    "Event %s : paramètre 'stick' absent dans l'URL (%s), ignoré.",
-                    event_id, url,
+                    "Event %s : stick=%s rldimm=%s — parametre manquant, ignore.",
+                    event_id, stick, rldimm,
                 )
                 continue
 
             reviews = scrape_reviews(url, max_reviews, delay=delay)
 
-            # On sauvegarde même si 0 avis (pour horodater et ne pas re-tenter en boucle)
+            # Sauvegarde meme si vide pour horodater et eviter de re-tenter en boucle
             update_event_reviews_in_db(event_id, reviews)
 
             if reviews:
                 processed += 1
-                logging.info("Event %s : %d avis sauvegardés.", event_id, len(reviews))
+                logging.info("Event %s : %d avis sauvegardes.", event_id, len(reviews))
             else:
                 skipped += 1
-                logging.warning("Event %s : aucun avis récupéré, table mise à jour avec [].", event_id)
+                logging.warning(
+                    "Event %s : aucun avis recupere, table mise a jour avec [].", event_id
+                )
 
         except Exception as exc:
             failed += 1
-            logging.exception("Event %s : échec scraping (%s)", event_id, exc)
+            logging.exception("Event %s : echec scraping (%s)", event_id, exc)
 
     logging.info(
-        "Terminé — processed=%d  skipped=%d  failed=%d",
+        "Termine — processed=%d  skipped=%d  failed=%d",
         processed, skipped, failed,
     )
 
@@ -288,9 +315,9 @@ def update_google_reviews(**_context):
 with DAG(
     dag_id="profil_event_update_google_reviews",
     description=(
-        "Met à jour google_reviews dans profil_event pour tous les events "
-        "ayant un paramètre 'stick' dans urlGoogleMapsAvis. "
-        "Priorité aux events jamais scrappés, puis mise à jour des plus anciens."
+        "Met a jour google_reviews dans profil_event pour tous les events "
+        "ayant stick + rldimm dans urlGoogleMapsAvis. "
+        "Priorite aux events jamais scrappe, puis les plus anciens."
     ),
     default_args=default_args,
     start_date=days_ago(1),
