@@ -89,7 +89,7 @@ def fetch_events_to_scrape(limit: int) -> list[tuple[int, str]]:
         FROM profil_event
         WHERE "urlGoogleMapsAvis" IS NOT NULL
           AND "urlGoogleMapsAvis" <> ''
-          AND "urlGoogleMapsAvis" LIKE '%stick=%'
+          AND "urlGoogleMapsAvis" LIKE '%%stick=%%'
         ORDER BY
             google_reviews_updated_at ASC NULLS FIRST,
             id ASC
