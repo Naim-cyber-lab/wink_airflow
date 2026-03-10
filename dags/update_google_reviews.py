@@ -50,6 +50,11 @@ def fetch_events_to_scrape(limit: int) -> list[tuple[int, str]]:
         WHERE "urlGoogleMapsAvis" IS NOT NULL
           AND "urlGoogleMapsAvis" <> ''
         ORDER BY
+            -- Priorité 1 : jamais scrappé (updated_at NULL)
+            CASE WHEN google_reviews_updated_at IS NULL THEN 0 ELSE 1 END ASC,
+            -- Priorité 2 : scrappé mais liste vide ([] ou NULL)
+            CASE WHEN google_reviews IS NULL OR google_reviews::text = '[]' THEN 0 ELSE 1 END ASC,
+            -- Priorité 3 : les plus anciens en dernier
             google_reviews_updated_at ASC NULLS FIRST,
             id ASC
         LIMIT %s
@@ -189,8 +194,14 @@ async def _scrape_one_url(
                 return
             try:
                 body = await response.text()
-                # Filtre rapide : seules les reponses avec des dates d'avis
-                if "il y a" not in body and "ago" not in body:
+                # Filtre rapide : on vérifie que c'est bien une réponse d'avis
+                # (évite de parser des réponses vides ou d'autres endpoints)
+                # On accepte toutes les formes de dates : "il y a", "ago",
+                # "cette semaine", "hier", "janvier", dates absolues, etc.
+                # Seul vrai signal fiable : présence d'un champ auteur/note
+                if "GetLocalBoqProxy" not in response.url and "PrivateLocalSearch" not in response.url:
+                    return
+                if len(body) < 500:  # réponse trop courte = pas d'avis
                     return
                 batch = _parse_reviews_from_body(body)
                 for r in batch:
@@ -272,14 +283,15 @@ def update_google_reviews(**_context):
         try:
             reviews = scrape_reviews(url, max_reviews)
 
-            update_event_reviews_in_db(event_id, reviews)
-
             if reviews:
+                update_event_reviews_in_db(event_id, reviews)
                 processed += 1
                 logging.info("Event %s : %d avis sauvegardes.", event_id, len(reviews))
             else:
+                # On ne touche PAS la DB si 0 avis — l'event sera retenté
+                # au prochain run (google_reviews_updated_at reste NULL/ancien)
                 skipped += 1
-                logging.warning("Event %s : aucun avis recupere.", event_id)
+                logging.warning("Event %s : aucun avis recupere (URL peut-etre invalide ou temporairement inaccessible).", event_id)
 
         except Exception as exc:
             failed += 1
