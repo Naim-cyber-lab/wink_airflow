@@ -61,6 +61,9 @@ def _clean_url(raw: str) -> str | None:
         return None
     if "google.com" not in url:
         return None
+    # Sans "stick=", Google ne retourne pas le panneau avis — inutile de scraper
+    if "stick=" not in url:
+        return None
 
     return url
 
@@ -86,6 +89,7 @@ def fetch_events_to_scrape(limit: int) -> list[tuple[int, str]]:
         FROM profil_event
         WHERE "urlGoogleMapsAvis" IS NOT NULL
           AND "urlGoogleMapsAvis" <> ''
+          AND "urlGoogleMapsAvis" LIKE '%stick=%'
         ORDER BY
             google_reviews_updated_at ASC NULLS FIRST,
             id ASC
