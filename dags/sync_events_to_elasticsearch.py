@@ -226,6 +226,7 @@ def _parse_google_reviews(value: Any) -> List[dict]:
 
 
 
+def _embedding(text: str) -> List[float]:
     """
     Appelle le service FastAPI exposé dans Swagger:
     GET /embedding?text=...
