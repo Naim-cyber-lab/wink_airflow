@@ -27,6 +27,43 @@ default_args = {
 }
 
 
+
+# ================== URL CLEANER ==================
+def _clean_url(raw: str) -> str | None:
+    """
+    Nettoie et valide une URL Google Reviews avant scraping.
+    - Détecte les URLs concaténées (ex: "https://wwwhttps//...")
+    - Extrait la première URL valide si plusieurs sont collées
+    - Retourne None si l'URL est irrécupérable
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+
+    url = raw.strip()
+
+    # Cas : deux URLs collées — on extrait la dernière occurrence de "https://"
+    # ex: "https://wwwhttps//www.google.com/..." ou "urlhttps://www.google.com/..."
+    parts = re.split(r'(?<!^)https?://', url)
+    if len(parts) > 1:
+        # Garde la dernière partie qui ressemble à google.com
+        for part in reversed(parts):
+            candidate = "https://" + part if not part.startswith("http") else part
+            if "google.com" in candidate:
+                url = candidate
+                break
+
+    # Nettoyage basique
+    url = url.replace("wwwhttps//", "www.")  # artefact courant
+    url = url.strip()
+
+    # Validation minimale
+    if not url.startswith("https://") and not url.startswith("http://"):
+        return None
+    if "google.com" not in url:
+        return None
+
+    return url
+
 # ================== DB HELPERS ==================
 def _pg_connect():
     conn = BaseHook.get_connection(DB_CONN_ID)
@@ -50,11 +87,6 @@ def fetch_events_to_scrape(limit: int) -> list[tuple[int, str]]:
         WHERE "urlGoogleMapsAvis" IS NOT NULL
           AND "urlGoogleMapsAvis" <> ''
         ORDER BY
-            -- Priorité 1 : jamais scrappé (updated_at NULL)
-            CASE WHEN google_reviews_updated_at IS NULL THEN 0 ELSE 1 END ASC,
-            -- Priorité 2 : scrappé mais liste vide ([] ou NULL)
-            CASE WHEN google_reviews IS NULL OR google_reviews::text = '[]' THEN 0 ELSE 1 END ASC,
-            -- Priorité 3 : les plus anciens en dernier
             google_reviews_updated_at ASC NULLS FIRST,
             id ASC
         LIMIT %s
@@ -218,7 +250,17 @@ async def _scrape_one_url(
             await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
             await asyncio.sleep(4)  # Attendre le chargement initial des avis
 
-            await page.evaluate(_JS_FIND_SCROLL)
+            # Retry find scroll : le panneau avis peut mettre du temps à apparaître
+            found_scroll = False
+            for attempt in range(3):
+                found_scroll = await page.evaluate(_JS_FIND_SCROLL)
+                if found_scroll:
+                    break
+                logging.info("Scroll container non trouvé (tentative %d/3), attente 2s...", attempt + 1)
+                await asyncio.sleep(2)
+
+            if not found_scroll:
+                logging.warning("Scroll container introuvable après 3 tentatives — fallback window.scroll")
 
             scroll_pos  = 0
             stale_count = 0
@@ -281,7 +323,20 @@ def update_google_reviews(**_context):
 
     for event_id, url in rows:
         try:
-            reviews = scrape_reviews(url, max_reviews)
+            clean = _clean_url(url)
+            if not clean:
+                skipped += 1
+                logging.warning(
+                    "Event %s : URL invalide ou irrécupérable, ignoré. URL brute: %.120s",
+                    event_id, url
+                )
+                continue
+            if clean != url:
+                logging.warning(
+                    "Event %s : URL nettoyée\n  brut  : %.120s\n  propre: %.120s",
+                    event_id, url, clean
+                )
+            reviews = scrape_reviews(clean, max_reviews)
 
             if reviews:
                 update_event_reviews_in_db(event_id, reviews)
